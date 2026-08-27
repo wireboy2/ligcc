@@ -113,7 +113,8 @@ VK_LBUTTON, VK_MBUTTON, VK_CONTROL = 0x01, 0x04, 0x11
 MIN_VISIBLE = 80
 MONITOR_DEFAULTTONEAREST = 2
 
-# 记住上次的浮层状态（位置 / 字号 / 透明度）：exe 同目录 / 项目根目录下 history/
+# 记住上次的浮层状态（位置 / 字号 / 透明度 / 尺寸 / 截图屏）：
+# exe 同目录 / 项目根目录下 history/
 if getattr(sys, "frozen", False):
     _ROOT = os.path.dirname(sys.executable)
 else:
@@ -174,6 +175,25 @@ def load_saved_size() -> tuple[int, int] | None:
         return int(d["w"]), int(d["h"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def load_saved_monitor() -> int | None:
+    """上次用的截图显示器编号；没记过/损坏返回 None。
+
+    截图屏严格说不是「浮层状态」，但 Ctrl+Alt+M 是**截图屏和浮层一起换**的，
+    只记住浮层位置的话，下次启动浮层在屏 2、却还在截屏 1。两者存一个文件里，
+    才不会出现「记住了一半」这种状态。
+    """
+    d = load_state()
+    try:
+        return int(d["monitor"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def save_monitor(index: int) -> bool:
+    """记住当前截图显示器（下次启动沿用）。"""
+    return save_state(monitor=int(index))
 
 
 # gdiplus_render.present 负责"绘制 + UpdateLayeredWindow 提交"全流程，

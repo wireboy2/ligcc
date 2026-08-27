@@ -164,6 +164,81 @@ def _check_auto_quit():
     check("已经在退出了就不重复触发", calls == [], repr(calls))
 
 
+def _check_monitor_memory():
+    """截图屏的记忆：第二次启动别再「浮层在屏 2、截的是屏 1」。
+
+    _pick_monitor 把 mons 当参数收，所以这里喂一套合成的双屏布局就能测全部
+    分支，不需要真的插第二块显示器。状态文件已被 main() 指到临时目录。
+    """
+    import json
+    from types import SimpleNamespace
+    import main as main_mod
+    from main import App
+
+    # [0] 是合并虚拟屏；屏1 在左，屏2 在右
+    MONS = [{"left": 0, "top": 0, "width": 3840, "height": 1080},
+            {"left": 0, "top": 0, "width": 1920, "height": 1080},
+            {"left": 1920, "top": 0, "width": 1920, "height": 1080}]
+
+    def put(state: dict):
+        with open(ov_mod.STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+    def me(monitor=1, remember=True):
+        return SimpleNamespace(cfg=SimpleNamespace(monitor=monitor,
+                                                  overlay_remember_pos=remember,
+                                                  overlay_size=[820, 900]))
+
+    put({"monitor": 2, "x": 2000, "y": 40})
+    check("上次记的是屏 2 → 这次就截屏 2（不用再按一次 M）",
+          App._pick_monitor(me(), MONS, False) == 2)
+    check("命令行/config 写死了截图屏 → 记忆不许盖掉它",
+          App._pick_monitor(me(monitor=1), MONS, True) == 1)
+    check("remember_pos 关了 → 什么都不记，按配置来",
+          App._pick_monitor(me(remember=False), MONS, False) == 1)
+
+    # 老状态文件只有位置（升级上来的，或一直用 Ctrl+拖动挪浮层）
+    put({"x": 2400, "y": 100})
+    check("没记过截图屏 → 按浮层中心所在的屏推断（屏 2）",
+          App._pick_monitor(me(), MONS, False) == 2)
+    put({"x": 100, "y": 100})
+    check("浮层在屏 1 → 仍然截屏 1", App._pick_monitor(me(), MONS, False) == 1)
+    # 跨屏摆放：左上角在屏 1，中心已经过到屏 2
+    put({"x": 1500, "y": 100, "w": 1000, "h": 400})
+    check("跨屏摆放按中心判定（中心在屏 2）",
+          App._pick_monitor(me(), MONS, False) == 2)
+
+    put({"monitor": 3, "x": 10, "y": 10})
+    check("上次那块屏这次没插 → 退回配置的屏，不去截不存在的屏",
+          App._pick_monitor(me(), MONS, False) == 1)
+    put({})
+    check("从没记过 → 用配置值", App._pick_monitor(me(), MONS, False) == 1)
+    put({"monitor": "屏二", "x": None})
+    check("状态文件被写坏 → 当没记过", App._pick_monitor(me(), MONS, False) == 1)
+
+    # 切屏热键要把新的截图屏落盘 —— 这就是上面那些记忆的来源
+    real_cap, main_mod.ScreenCapturer = main_mod.ScreenCapturer, SimpleNamespace(
+        list_monitors=lambda: MONS)
+    try:
+        put({})
+        switching = SimpleNamespace(
+            capturer=SimpleNamespace(monitor=1), overlay=None,
+            cfg=SimpleNamespace(monitor=1, overlay_remember_pos=True))
+        App._cycle_monitor(switching)
+        check("按 M 切到屏 2 → 截图屏落盘",
+              ov_mod.load_saved_monitor() == 2 and switching.cfg.monitor == 2,
+              str(ov_mod.load_state()))
+        put({})
+        off = SimpleNamespace(capturer=SimpleNamespace(monitor=1), overlay=None,
+                              cfg=SimpleNamespace(monitor=1,
+                                                  overlay_remember_pos=False))
+        App._cycle_monitor(off)
+        check("remember_pos 关了就不写状态文件",
+              ov_mod.load_saved_monitor() is None)
+    finally:
+        main_mod.ScreenCapturer = real_cap
+
+
 def main():
     # 状态记忆改到临时文件，别污染 history/overlay_state.json
     tmpdir = tempfile.mkdtemp(prefix="ov_pos_")
@@ -424,6 +499,9 @@ def main():
 
     section("十二、--duration 到点自动退出")
     _check_auto_quit()
+
+    section("十三、截图屏记忆：重启后浮层和截图屏必须在同一块屏上")
+    _check_monitor_memory()
 
     print()
     print("=" * 70)

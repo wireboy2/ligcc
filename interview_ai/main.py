@@ -88,8 +88,8 @@ if sys.platform == "win32":
 
 from capture import ScreenCapturer, CaptureRegion
 from ocr import OCR, models_cached
-from overlay import (StealthOverlay, check_system, load_saved_pos,
-                     load_saved_size, load_state)
+from overlay import (StealthOverlay, check_system, load_saved_monitor,
+                     load_saved_pos, load_saved_size, load_state, save_monitor)
 from config import load_config, DeliveryMode, Config as _CfgDefaults
 from history import QALog
 
@@ -543,6 +543,10 @@ class App:
             self.cfg.delivery = DeliveryMode(args.delivery)
         if args.answer_mode:
             self.cfg.answer_mode = args.answer_mode
+        # 「显式指定了截图屏」= 命令行给了 --monitor，或 config.yaml 里写了非默认值。
+        # 这两种都是「钉死」的意思，不该被上次记住的截图屏盖掉（与 size/字号同一套规矩）
+        explicit_monitor = (args.monitor is not None
+                            or self.cfg.monitor != _CfgDefaults().monitor)
         if args.monitor is not None:
             self.cfg.monitor = args.monitor
 
@@ -551,6 +555,7 @@ class App:
         for i, m in enumerate(mons):
             tag = "全部合并" if i == 0 else ("主屏" if i == 1 else f"屏{i}")
             print(f"[monitor] {i}: {m['width']}x{m['height']} @({m['left']},{m['top']})  <- {tag}")
+        self.cfg.monitor = self._pick_monitor(mons, explicit_monitor)
         sel = mons[self.cfg.monitor] if 0 <= self.cfg.monitor < len(mons) else mons[1]
         print(f"[monitor] 当前截图屏: {self.cfg.monitor} ({sel['width']}x{sel['height']})")
 
@@ -994,6 +999,45 @@ class App:
         ov.move(ov.x + dx, ov.y + dy)
         print(f"[overlay] 位置 ({ov.x},{ov.y})")
 
+    def _pick_monitor(self, mons: list[dict], explicit: bool) -> int:
+        """决定这一轮截哪块屏。
+
+        优先级：`--monitor` / config 里写死的 > 上次记住的截图屏 >
+        上次浮层所在的屏 > config 默认（主屏）。
+
+        为什么要记：Ctrl+Alt+M 换的是「截图屏 + 浮层」两样，可上一版只把浮层
+        位置落了盘。于是第二次启动浮层出现在屏 2、截的却还是屏 1，得再按一次
+        M 才对得上 —— 而这时屏幕上没有任何迹象表明截错了屏。
+
+        没记过截图屏（老状态文件，或一直用拖动挪浮层）就按**浮层落在哪块屏**
+        来猜：浮层在哪块屏上答题，要看的题目就在那块屏上。
+        """
+        n = len(mons) - 1                       # 实际显示器数（[0] 是合并虚拟屏）
+        if explicit or not self.cfg.overlay_remember_pos:
+            return self.cfg.monitor
+        st = load_state()
+        want = load_saved_monitor()
+        why = "沿用上次记住的截图屏"
+        if want is None and isinstance(st.get("x"), int):
+            w, h = (st.get("w") or self.cfg.overlay_size[0],
+                    st.get("h") or self.cfg.overlay_size[1])
+            # 用浮层中心而不是左上角：跨屏摆放时中心落在哪块屏才算在哪块屏
+            cx, cy = st["x"] + w // 2, st.get("y", 0) + h // 2
+            want = next((i for i in range(1, n + 1)
+                         if mons[i]["left"] <= cx < mons[i]["left"] + mons[i]["width"]
+                         and mons[i]["top"] <= cy < mons[i]["top"] + mons[i]["height"]),
+                        None)
+            why = "按上次浮层所在的屏推断截图屏"
+        if want is None or want == self.cfg.monitor:
+            return self.cfg.monitor
+        if not 1 <= want <= n:
+            # 外接屏这次没插：别去截一块不存在的屏（mss 会直接抛 IndexError）
+            print(f"[monitor] 上次用的屏 {want} 这次不在了（现在 {n} 块），"
+                  f"退回屏 {self.cfg.monitor}")
+            return self.cfg.monitor
+        print(f"[monitor] {why}: {want}")
+        return want
+
     def _cycle_monitor(self):
         """热键 M：循环切换截图显示器 1→2→…→n→1，浮层跟随移动。"""
         mons = ScreenCapturer.list_monitors()
@@ -1007,6 +1051,9 @@ class App:
         self.cfg.monitor = new
         m = mons[new]
         print(f"[monitor] 截图屏 {old} → {new}: {m['width']}x{m['height']} @({m['left']},{m['top']})")
+        # 记住这块屏：下次启动才不会「浮层在屏 2、截的是屏 1」（见 _pick_monitor）
+        if self.cfg.overlay_remember_pos:
+            save_monitor(new)
         if self.overlay:
             x = m["left"] + max(40, m["width"] - self.overlay.width - 40)
             y = m["top"] + 40
