@@ -56,11 +56,12 @@ API 配置
 仅 Windows 可用。
 """
 import argparse
+import itertools
 import os
 import sys
 import time
 import threading
-from typing import Callable
+from typing import Callable, Iterable, Iterator
 
 # PaddleOCR 模型缓存重定向：
 # - 打包成 exe 后：放 exe 同目录 .paddle_cache（模型下载一次后复用）
@@ -98,6 +99,158 @@ import urllib.error
 
 
 # ---------------------------------------------------------------------------
+# 流式作答（SSE）：边收边投，不再干等整段响应
+# ---------------------------------------------------------------------------
+class ApiError(RuntimeError):
+    """HTTP 层失败，带上响应体。
+
+    代理把真实原因写在 body 里（模型名写错、余额不足、不认某个字段），
+    不读出来就只剩一句 "HTTP Error 400: Bad Request"，等于没说。
+    """
+
+    def __init__(self, code: int, detail: str):
+        super().__init__(f"HTTP {code}: {detail or '(无响应体)'}")
+        self.code = code
+        self.detail = detail
+
+
+class StreamInterrupted(Exception):
+    """SSE 流中途断开，但**已经收到了部分正文**（在 partial 里）。
+
+    单拎一个类型出来，是为了让上层能区分两种失败：
+      · 一个字都没收到（403 / 连不上 / 空闲超时）→ 该重试；
+      · 已经流出来半页 → **不能**重试。用户正照着抄，重试会把浮层
+        推回开头再重写一遍，比缺半页更糟。
+    """
+
+    def __init__(self, partial: str, cause: BaseException):
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.partial = partial
+        self.cause = cause
+
+
+def parse_sse_lines(lines: Iterable[bytes]) -> Iterator[dict]:
+    """SSE 字节行流 → 一串 data 载荷（dict）。
+
+    只认 `data:` 行：事件类型在载荷的 `type` 字段里也有一份，连 `event:` 行
+    一起认会把同一个事件数两遍。空行、`:` 心跳注释行一律跳过；单行 JSON 解析
+    失败也只跳过这一行 —— 代理偶尔插自己的东西，为一行噪音丢掉整个答案不值得。
+
+    OpenAI 风格的 `data: [DONE]` 折成 `message_stop`：两者语义相同（流正常
+    收尾），而「有没有收到收尾事件」是判断答案完整与否的唯一依据，
+    不能因为端点用了另一种写法就当没收到。
+    """
+    for raw in lines:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        body = line[len("data:"):].strip()
+        if not body:
+            continue
+        if body == "[DONE]":
+            yield {"type": "message_stop"}
+            continue
+        try:
+            obj = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def collect_sse_answer(lines: Iterable[bytes],
+                       on_text: Callable[[str], None] | None = None) -> tuple[str, int]:
+    """消费 Anthropic Messages 的 SSE 事件流 → (完整正文, thinking 字数)。
+
+    正文在 `content_block_delta` 的 `delta.text` 里；同一个事件也可能带
+    `delta.thinking`（深度思考的过程），那部分**不进答案**，只数字数用来
+    确认「关闭深度思考」这个开关到底有没有生效。
+
+    收尾事件（`message_stop` / 带 stop_reason 的 `message_delta`）必须收到，
+    否则算断流：实测这个代理会在答到一半时静悄悄 EOF（没有异常、没有收尾
+    事件），那时 socket 读到的就是干净的流结束 —— 不检查的话，半句话会被
+    当成完整答案交出去，比报错更坏。
+
+    :param on_text: 每收到一块正文调一次，参数是**当前已累积的全文**
+                    —— 浮层要的就是全文，节流交给回调方（见 StreamSink）。
+                    回调自己抛异常不会带走答案：改成收完再显示。
+    :raises StreamInterrupted: 中途断开/提前结束，且已收到正文
+    """
+    parts: list[str] = []
+    think_chars = 0
+    done = False
+    try:
+        for ev in parse_sse_lines(lines):
+            kind = ev.get("type")
+            if kind == "content_block_delta":
+                delta = ev.get("delta") or {}
+                chunk = delta.get("text")
+                if isinstance(chunk, str) and chunk:
+                    parts.append(chunk)
+                    if on_text:
+                        try:
+                            on_text("".join(parts))
+                        except Exception as e:
+                            on_text = None
+                            print(f"[stream] 增量投递失败，改为收完再显示: {e}")
+                    continue
+                think = delta.get("thinking")
+                if isinstance(think, str):
+                    think_chars += len(think)
+            elif kind == "message_stop":
+                done = True
+            elif kind == "message_delta":
+                if (ev.get("delta") or {}).get("stop_reason"):
+                    done = True
+            elif kind == "error":
+                err = ev.get("error") if isinstance(ev.get("error"), dict) else {}
+                raise RuntimeError(f"服务端错误 {err.get('type', '?')}: "
+                                   f"{err.get('message') or ev}")
+        if not done and parts:
+            raise RuntimeError("流提前结束（没有收到 message_stop，答案是半截的）")
+    except Exception as e:
+        text = "".join(parts)
+        if text.strip():
+            raise StreamInterrupted(text, e) from e
+        raise
+    return "".join(parts), think_chars
+
+
+class StreamSink:
+    """流式增量 → 浮层，按时间节流。
+
+    为什么必须节流：一次长答案上千个增量块（实测 1125 块 / 12578 字），
+    每块都重绘一次就是上千次「整篇重折行 + GDI+ 重画 + UpdateLayeredWindow」。
+    OCR 刚满载跑完，CPU 得留给系统输入 —— 「OCR 时鼠标不卡」是这个浮层的
+    卖点之一，不能在作答阶段还回去。~8fps 肉眼已经是「在打字」，更快没有
+    信息量。第一块不等节流，立刻显示（首字出现的时刻才是用户的体感）。
+    """
+
+    INTERVAL = 0.12   # 秒
+
+    def __init__(self, show: Callable[[str], None],
+                 interval: float | None = None,
+                 clock: Callable[[], float] = time.monotonic):
+        self._show = show
+        self._interval = self.INTERVAL if interval is None else interval
+        self._clock = clock
+        self._last = None
+        self.delivered = False   # 真的投过内容吗（决定收尾要不要保住滚动位置）
+
+    def __call__(self, text: str):
+        now = self._clock()
+        if self._last is not None and now - self._last < self._interval:
+            return
+        self._last = now
+        try:
+            self._show(text)
+            self.delivered = True
+        except Exception as e:
+            print(f"[stream] 浮层刷新失败: {e}")
+
+
+# ---------------------------------------------------------------------------
 # 答案生成：调用 Claude API (兼容 Anthropic Messages 格式)
 # ---------------------------------------------------------------------------
 class AnswerProvider:
@@ -106,11 +259,17 @@ class AnswerProvider:
     通过配置的 Claude API 接口完成解答。
     """
 
-    def __init__(self, mode: str = "api", api_key: str = "", api_url: str = "", model: str = ""):
+    def __init__(self, mode: str = "api", api_key: str = "", api_url: str = "",
+                 model: str = "", no_thinking: bool = True):
         self.mode = mode
         self.api_key = api_key
         self.api_url = api_url
         self.model = model
+        # 关掉模型的深度思考（见 _call_api）。留成开关是因为「要不要思考」
+        # 本质是取舍：面试场景要首字快，别的用法可能宁可等更好的推理
+        self.no_thinking = no_thinking
+        # 端点认不认 thinking 字段（探到 400 就本次运行不再发，见 _call_api）
+        self._thinking_param = True
         # 重试时的进度回调（App 会接到浮层上）。代理抖一下要等 2s+4s，
         # 这十几秒里不说话，用户只会以为程序死了
         self.status_cb: Callable[[str], None] | None = None
@@ -122,11 +281,13 @@ class AnswerProvider:
             except Exception:
                 pass
 
-    def answer(self, question: str) -> str:
-        """单次识别文本 → 答案。"""
-        return self._answer_with_retry(question)
+    def answer(self, question: str,
+               on_text: Callable[[str], None] | None = None) -> str:
+        """单次识别文本 → 答案。on_text 见 collect_sse_answer（流式增量回调）。"""
+        return self._answer_with_retry(question, on_text)
 
-    def answer_from_passes(self, passes: list[str]) -> str:
+    def answer_from_passes(self, passes: list[str],
+                           on_text: Callable[[str], None] | None = None) -> str:
         """
         多次 OCR 识别结果 → 答案（视为同一道题）。
 
@@ -137,7 +298,7 @@ class AnswerProvider:
         if not valid:
             return ""
         if len(valid) == 1:
-            return self._answer_with_retry(valid[0])
+            return self._answer_with_retry(valid[0], on_text)
 
         sections = "\n\n".join(
             f"【第 {i} 次识别】\n{p}" for i, p in enumerate(valid, 1)
@@ -150,9 +311,10 @@ class AnswerProvider:
             "然后直接给出简洁准确的答案；如果是代码题请给出完整可运行的代码。\n\n"
             + sections
         )
-        return self._answer_with_retry(merged)
+        return self._answer_with_retry(merged, on_text)
 
-    def _answer_with_retry(self, question: str) -> str:
+    def _answer_with_retry(self, question: str,
+                           on_text: Callable[[str], None] | None = None) -> str:
         if not question.strip():
             return ""
         if self.mode == "none":
@@ -164,7 +326,12 @@ class AnswerProvider:
         last_err = None
         for attempt in range(3):
             try:
-                return self._call_claude(question)
+                return self._call_claude(question, on_text)
+            except StreamInterrupted as e:
+                # 已经流出来的半页答案比「从头再来」有用：用户正照着抄，
+                # 把浮层推回开头等于让他白抄一遍。所以不重试，保留 + 标一行
+                print(f"[api] 流中断，保留已收到的 {len(e.partial)} 字：{e}")
+                return f"{e.partial}\n\n【连接中断，已保留 {len(e.partial)} 字】"
             except Exception as e:
                 last_err = e
                 print(f"[api] 第 {attempt + 1} 次调用失败: {e}")
@@ -250,42 +417,115 @@ class AnswerProvider:
                     return q, a
         return None
 
-    def _call_claude(self, question: str) -> str:
+    def _call_claude(self, question: str,
+                     on_text: Callable[[str], None] | None = None) -> str:
         """解答入口：拼解答提示词后调用 API。"""
         content = (
             "你是一个面试/编程题解答助手。请直接给出简洁准确的答案，"
             "如果是代码题请给出完整可运行的代码。\n\n"
             f"题目：\n{question}"
         )
-        return self._call_api(content)
+        return self._call_api(content, on_text=on_text)
 
-    def _call_api(self, content: str, max_tokens: int = 4096) -> str:
-        """裸调用 Claude Messages API（content 即完整 user 消息）。"""
+    # 空闲超时（秒）。urlopen 的 timeout 是**单次 socket 读**的超时，不是整轮
+    # 耗时 —— 这正好是流式要的语义：只要还在往下吐（ping、增量块都算）就不算
+    # 空闲。上一版不流式，服务端在算完之前一个字节都不发，一道长题（实测
+    # 133s）必然在 60s 处 socket.timeout，然后白白重试 3 次、共等 3 分钟，
+    # 最后浮层上写「API 调用失败」—— 答案其实一直好好地在路上。
+    IDLE_TIMEOUT = 180
+
+    def _call_api(self, content: str, max_tokens: int = 4096,
+                  on_text: Callable[[str], None] | None = None) -> str:
+        """流式调用 Claude Messages API（content 即完整 user 消息）。
+
+        :param on_text: 增量回调，见 collect_sse_answer。None 也照样走流式 ——
+                        流式顺手解决了长答案在 60s 处超时那个坑（见
+                        IDLE_TIMEOUT），后台整理历史记录同样受益。
+        :return: 完整答案正文
+        """
         payload = {
             "model": self.model,
             "max_tokens": max_tokens,
+            "stream": True,
             "messages": [{"role": "user", "content": content}],
         }
+        # 关掉深度思考。实测这个端点：不带这个字段时首个正文字要等 21s
+        # （前面全是 thinking 增量块），带上只要 6s。答题场景要的是「马上出
+        # 字、边看边抄」，不是更漂亮的推理链
+        if self.no_thinking and self._thinking_param:
+            payload["thinking"] = {"type": "disabled"}
+
+        try:
+            resp = self._open(payload)
+        except ApiError as e:
+            # 换到不认这个字段的端点时别整个功能挂掉（第三方代理各有各的脾气）：
+            # 去掉字段重来一次，并记下本次运行不再发它
+            if ("thinking" in payload and e.code == 400
+                    and "thinking" in e.detail.lower()):
+                print(f"[api] 端点不接受 thinking 字段（{e.detail[:80]}），"
+                      f"本次运行改为不发；模型可能会深度思考，首字更慢")
+                self._thinking_param = False
+                payload.pop("thinking")
+                resp = self._open(payload)
+            else:
+                raise
+
+        try:
+            first = resp.readline()
+            if first.lstrip()[:1] in (b"{", b"["):
+                # 端点无视了 stream:true，直接吐了整个 JSON 响应：按非流式读完
+                body = json.loads((first + resp.read()).decode("utf-8", "replace"))
+                return self._text_from_message(body)
+            text, think_chars = collect_sse_answer(
+                itertools.chain([first], resp), on_text)
+        finally:
+            resp.close()
+
+        if think_chars:
+            # 开关没生效（端点自己加的思考/忽略了字段）。不影响答案，但首字会慢
+            print(f"[api] 本次仍有 {think_chars} 字深度思考（端点未采纳关闭请求）")
+        if not text.strip():
+            # 空响应当失败抛出去，让上层重试；否则浮层会永远停在「AI 作答中…」
+            raise RuntimeError("服务端没有返回正文（流里没有 text 增量）")
+        return text
+
+    def _open(self, payload: dict):
+        """发请求，返回**还没读**的响应对象（流式要自己逐行读）。"""
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
             "anthropic-version": "2023-06-01",
+            "Accept": "text/event-stream",
             # 该代理屏蔽 Python 默认 UA，必须带常规浏览器 UA
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         }
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(self.api_url, data=data, headers=headers, method="POST")
+        req = urllib.request.Request(self.api_url, data=data, headers=headers,
+                                     method="POST")
+        try:
+            return urllib.request.urlopen(req, timeout=self.IDLE_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace").strip()[:300]
+            except Exception:
+                pass
+            raise ApiError(e.code, detail) from e
 
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+    @staticmethod
+    def _text_from_message(body: dict) -> str:
+        """非流式响应里取正文（端点无视 stream 时的兜底）。
 
-        # Anthropic Messages 格式：content 是块列表（可能含 thinking 块），
-        # 真正的答案在所有 type=="text" 的块里
-        content = body.get("content", [])
-        if content and isinstance(content, list):
-            texts = [b.get("text", "") for b in content
+        Anthropic Messages 格式：content 是块列表（可能含 thinking 块），
+        真正的答案在所有 type=="text" 的块里。
+        """
+        blocks = body.get("content") if isinstance(body, dict) else None
+        if isinstance(blocks, list):
+            texts = [b.get("text", "") for b in blocks
                      if isinstance(b, dict) and b.get("type") == "text"]
-            return "\n".join(t for t in texts if t)
+            joined = "\n".join(t for t in texts if t)
+            if joined:
+                return joined
         return str(body)
 
 
@@ -325,6 +565,7 @@ class App:
             api_key=self.cfg.api_key,
             api_url=self.cfg.api_url,
             model=self.cfg.api_model,
+            no_thinking=self.cfg.api_no_thinking,
         )
         # 重试等待期间的提示也投到浮层（回调在浮层建好之后才可能被调用）
         self.answerer.status_cb = lambda m: self._status(m, "api")
@@ -502,9 +743,11 @@ class App:
                          + "\n\n".join(self._passes), "ocr")
         else:
             self._status(f"AI 作答中…（已识别 {chars} 字）", "answer")
-        answer = self.answerer.answer_from_passes(self._passes)
+        # 流式：模型吐一块就往浮层刷一块，长代码题不用干等整段
+        sink = self._stream_sink()
+        answer = self.answerer.answer_from_passes(self._passes, on_text=sink)
         self._last_answer = answer
-        self._deliver(answer)
+        self._deliver(answer, streamed=bool(sink and sink.delivered))
 
         # 复盘存储：Q/A 均落盘（A 更新同一条记录）。
         # 原始内容先落盘（AI 整理失败也不丢数据）；递增版本号与落盘
@@ -549,13 +792,37 @@ class App:
 
         threading.Thread(target=_task, daemon=True).start()
 
-    def _deliver(self, answer: str):
+    def _stream_sink(self) -> StreamSink | None:
+        """流式增量的投递口。
+
+        只有浮层模式有意义：剪贴板没法「写一半」（半段代码被粘出去更糟），
+        `--delivery clipboard` 仍然等全文一次写入。
+        """
+        if self.cfg.delivery != DeliveryMode.OVERLAY or not self.overlay:
+            return None
+
+        def show(text: str):
+            # keep_scroll：用户可能已经翻到中间照着抄，每来一块都归零
+            # 会把他反复拽回开头
+            self.overlay.set_text(text, keep_scroll=True)
+            self.overlay.show()
+
+        return StreamSink(show)
+
+    def _deliver(self, answer: str, streamed: bool = False):
+        """把最终答案投出去。
+
+        :param streamed: 内容已经边收边投到浮层了，这里只是收尾（补上最后
+                         一块增量、把「连接中断」那行加上）。此时不能把滚动
+                         位置归零 —— 用户可能正滚到中间抄着。
+        """
         if not answer.strip():
             return
         if self.cfg.delivery == DeliveryMode.OVERLAY and self.overlay:
-            self.overlay.set_text(answer)
+            self.overlay.set_text(answer, keep_scroll=streamed)
             self.overlay.show()
-            print("[deliver] 答案已送到隐形浮层（照着抄）")
+            print(f"[deliver] 答案已送到隐形浮层"
+                  f"（{'流式，边收边显示' if streamed else '照着抄'}）")
         else:
             try:
                 import pyperclip
@@ -928,7 +1195,8 @@ def cmd_refine(args) -> int:
         print(f"备份失败（继续整理）：{e}")
 
     provider = AnswerProvider(mode="api", api_key=cfg.api_key,
-                              api_url=cfg.api_url, model=cfg.api_model)
+                              api_url=cfg.api_url, model=cfg.api_model,
+                              no_thinking=cfg.api_no_thinking)
     ok = fail = 0
     for i, eid in enumerate(ids, 1):
         rec = qa.get(eid)

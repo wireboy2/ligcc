@@ -36,12 +36,16 @@ except Exception:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# (脚本名, 是否需要真实 Windows 桌面会话, 一句话说明)
+# (脚本名, 运行要求, 一句话说明)
+#   any     = 任何平台都能跑（Win32 全被 mock 掉了）
+#   windows = 需要 Windows（import 就会碰 ctypes.windll，但不用真桌面）
+#   desktop = 还需要真实桌面会话（建真窗口、装钩子）
 SUITES = [
-    ("test_validate.py", False, "静态架构约束（语法 + 跨模块引用 + 隐蔽性约束）"),
-    ("test_config.py", False, "config 解析：热键字符串、颜色、尺寸"),
-    ("test_render_mock.py", False, "渲染逻辑：mock Win32，句柄生命周期与折行"),
-    ("test_move.py", True, "浮层交互：拖动/停靠/翻页/尺寸/状态反馈/自动退出"),
+    ("test_validate.py", "any", "静态架构约束（语法 + 跨模块引用 + 隐蔽性约束）"),
+    ("test_config.py", "any", "config 解析：热键字符串、颜色、尺寸"),
+    ("test_render_mock.py", "any", "渲染逻辑：mock Win32，句柄生命周期与折行"),
+    ("test_stream.py", "windows", "流式作答：SSE 解析、节流投递、断流保留半页"),
+    ("test_move.py", "desktop", "浮层交互：拖动/停靠/翻页/尺寸/状态反馈/自动退出"),
 ]
 
 # 要人眼确认的，不进自动跑：共享画面里到底看不看得见，只能自己开会议看
@@ -80,12 +84,13 @@ def main() -> int:
 
     win = sys.platform == "win32"
     results: list[tuple[str, str, float]] = []   # (脚本, 结论, 耗时)
-    for script, needs_desktop, desc in SUITES:
+    for script, needs, desc in SUITES:
         if args.filter and args.filter.lower() not in script.lower():
             continue
-        if needs_desktop and not win:
+        if needs != "any" and not win:
             # 非 Windows 上不是失败，是跑不了：CI 的 ubuntu runner 走这条
-            results.append((script, "跳过（需要 Windows 桌面会话）", 0.0))
+            why = "需要 Windows 桌面会话" if needs == "desktop" else "需要 Windows"
+            results.append((script, f"跳过（{why}）", 0.0))
             continue
         if not args.quiet:
             print()

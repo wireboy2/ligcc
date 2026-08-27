@@ -466,12 +466,23 @@ class StealthOverlay:
             print(f"[overlay] 折行失败，按原样显示: {e}")
             self._lines = list(raw) or [""]
 
-    def set_text(self, text: str):
-        """更新浮层内容（线程安全，可被识别线程直接调用）。新内容回到顶部。"""
+    def set_text(self, text: str, keep_scroll: bool = False):
+        """更新浮层内容（线程安全，可被识别线程直接调用）。
+
+        :param keep_scroll: 默认 False = 新内容回到顶部（新答案就该从头看）。
+                            流式作答必须传 True：每来一块增量都归零，用户翻到
+                            中间照着抄的位置会被反复拽回开头。内容变短时偏移
+                            夹回范围内，不会停在一屏空白上。
+        """
         with self._lock:
             self._raw_lines = text.splitlines() or [""]
             self._rewrap()
-        self._scroll_offset = 0
+            total = len(self._lines)
+        if keep_scroll:
+            max_off = max(0, total - self.visible_lines())
+            self._scroll_offset = max(0, min(self._scroll_offset, max_off))
+        else:
+            self._scroll_offset = 0
         try:
             self._render()
         except Exception as e:

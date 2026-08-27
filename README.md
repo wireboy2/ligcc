@@ -31,6 +31,9 @@
 ## 它到底能做什么
 
 - **一键解题**：按 `Ctrl+Alt+Q` → 截当前屏 → PaddleOCR 提取文字 → 调模型 → 答案出现在浮层。
+- **答案边写边看**：模型的输出走 SSE 流式接收，收到一块就刷一次浮层（约 8 fps 节流），
+  首字通常 6 秒左右出现，不用等整篇写完；正在翻看的位置不会被增量刷新拽回开头。
+  默认还会请求关掉深度思考（`thinking: disabled`），首字实测 21s → 6s。
 - **共享里隐身**：浮层调用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`，
   腾讯会议 / Zoom / Teams / OBS / 微信共享屏幕都抓不到它（本机肉眼可见）。
 - **不挡操作**：浮层是「点击穿透」窗口，鼠标点击照常落到下层 IDE / 浏览器。
@@ -64,9 +67,9 @@ Ctrl+Alt+Q
    │
    ├─ capture.py    mss 抓帧（BGRA→BGR，约 5-15ms）
    ├─ ocr.py        PaddleOCR PP-OCRv5 mobile，本地 CPU 推理，画面指纹缓存
-   ├─ main.py       拼提示词 → Anthropic Messages 格式 API（urllib，带 3 次重试）
+   ├─ main.py       拼提示词 → Anthropic Messages 格式 API（urllib，SSE 流式，带 3 次重试）
    └─ overlay.py    GDI+ 画到 ARGB 位图 → UpdateLayeredWindow 每像素 Alpha 提交
-        └─ gdiplus_render.py
+        └─ gdiplus_render.py   （流式：每来一块正文就重画一次，8 fps 节流）
 ```
 
 隐蔽性由四件事叠加实现，每一件都是官方 API，没有注入、没有 hook 系统进程：
@@ -252,6 +255,7 @@ ligcc/
    ├─ test_validate.py       静态架构约束检查（AST，任何平台可跑）
    ├─ test_config.py         config 解析单测：热键字符串、颜色（任何平台可跑）
    ├─ test_render_mock.py    mock Win32 DLL 跑通渲染逻辑（任何平台可跑）
+   ├─ test_stream.py         流式作答单测：SSE 解析、节流投递、断流保留半页（需 Windows）
    └─ test_move.py           浮层拖动/停靠/翻页/字号透明度/状态记忆（需真实 Windows 桌面）
 ```
 
@@ -301,6 +305,9 @@ python test_config.py
 # 渲染逻辑（mock 掉 gdiplus/user32，验证句柄生命周期与 UpdateLayeredWindow 参数）
 python test_render_mock.py
 
+# 流式作答（喂假的 SSE 字节流 + 假时钟：解析噪音、节流、断流保留半页）—— 需要 Windows
+python test_stream.py
+
 # 浮层交互（拖动/停靠/边界夹取/翻页/字号透明度/状态记忆）—— 需要真实 Windows 桌面会话
 python test_move.py
 
@@ -348,7 +355,8 @@ python overlay.py
   `config.yaml` 后重启**。
 - `capture_backend` 只有 `mss` 一种；`wgc`（能抓被遮挡的窗口）尚未实现，
   配了会提示一句并自动降级到 `mss`。
-- 答案不是流式的，长代码题要等模型完整返回。
+- 答案边收边显示，但**中途断流只保留已收到的部分**（末尾标一行「连接中断，已保留 N 字」），
+  不会自动续写 —— 重试会把你正在抄的半页推翻重来。再按一次解答键即可。
 - 进程是 DPI-unaware 的，高 DPI 屏上坐标是虚拟化后的值（多屏混合缩放已做兼容）。
 
 ## 路线图
@@ -358,9 +366,9 @@ python overlay.py
 - **WGC 采集后端** —— `Windows.Graphics.Capture` 能抓**被其它窗口遮挡**的目标窗口，
   「题目在后面那个窗口里」就不用先切前台了，帧率也高得多。代价是引入 WinRT 绑定
   加一小段 D3D 互操作，打包体积会明显变大。（`capture.py:_grab_wgc`）
-- **流式答案** —— 现在 `_call_api` 一次性等完整响应；改 SSE（`"stream": true`）
-  边收边 `set_text`，长代码题的感知延迟能从「十几秒空白」变成「一秒出头」。
-  （`main.py:AnswerProvider._call_api`）
+- **流式答案** —— ✅ 已实现（`main.py:collect_sse_answer` / `StreamSink`）：
+  `stream: true` 逐块投浮层，并默认发 `thinking: {"type": "disabled"}` 关掉深度思考，
+  实测首字 21s → 6s。要看模型的思考过程就把 `api.no_thinking` 设成 `false`。
 - **复盘导出增强** —— 按日期/关键词筛选、导出 HTML 或单页；`--export-md`
   目前是全量重写 `复盘记录.md`。（`history.py`、`main.py:cmd_export_md`）
 - **锁依赖版本** —— `requirements.txt` 现在全是 `>=`。PaddleOCR 2.x/3.x 的 API

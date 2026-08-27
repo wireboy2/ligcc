@@ -22,6 +22,10 @@ answer_mode: api      # api=调用下面配置的模型；none=只 OCR 不解答
 #   key: sk-xxxx
 #   url: https://你的接口地址/v1/messages
 #   model: claude-sonnet-4-5
+#   # 请求模型不要深度思考（发 thinking: {"type": "disabled"}）。
+#   # 面试场景要的是快：实测首字 21s → 6s，答案质量对这类题目没有可感差别。
+#   # 想看模型的推理过程、或者端点不认这个字段（会自动去掉重试一次）就设成 false
+#   no_thinking: true
 
 # ---------- 答案投递方式 ----------
 delivery: overlay     # overlay=隐形浮层（默认）；clipboard=写剪贴板

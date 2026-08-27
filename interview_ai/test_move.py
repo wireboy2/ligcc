@@ -89,7 +89,7 @@ def _check_status_feedback():
         def __init__(self):
             self.text, self.shown = None, False
 
-        def set_text(self, t):
+        def set_text(self, t, keep_scroll=False):
             self.text = t
 
         def show(self):
@@ -385,6 +385,24 @@ def main():
         check("浮层隐藏时滚轮不拦截（不抢下层页面的滚动）",
               ov._handle_mouse(WM_MOUSEWHEEL, 450, 350, delta=-120) is False)
         ov.show()
+
+        section("九之二、set_text(keep_scroll)：流式作答不能把人拽回开头")
+        ov.set_text("\n".join(f"line {i}" for i in range(60)))
+        ov.scroll(5)
+        off = ov._scroll_offset
+        check("先翻到中间", off == 5, f"offset={off}")
+        # 流式：又来一块增量、内容变长，用户正在看的位置必须原地不动
+        ov.set_text("\n".join(f"line {i}" for i in range(80)), keep_scroll=True)
+        check("keep_scroll=True 的增量刷新不动滚动位置", ov._scroll_offset == off,
+              f"offset={ov._scroll_offset}")
+        # 内容变短（比如断流后只剩半页）→ 偏移要夹回来，不能停在一屏空白上
+        ov.set_text("只有一行", keep_scroll=True)
+        check("内容变短 → 偏移夹回 0（不会停在一屏空白上）", ov._scroll_offset == 0,
+              f"offset={ov._scroll_offset}")
+        ov.set_text("\n".join(f"line {i}" for i in range(60)))
+        ov.scroll(5)
+        ov.set_text("新的一道题的答案")
+        check("默认（新答案）仍然回到顶部", ov._scroll_offset == 0)
 
         section("十、钩子安装 / 卸载（真机装一次，立刻卸掉）")
         hooked = ov.install_mouse_hook()

@@ -29,6 +29,9 @@ class Config:
     api_key: str = ""                # Claude API Key
     api_url: str = ""                # API 端点 URL
     api_model: str = ""              # 模型名称
+    # 让模型别做深度思考：答题要的是「马上出字、边看边抄」，思考链再漂亮也
+    # 是干等（实测首个正文字 21s → 6s）。False=不干预，模型爱想多久想多久
+    api_no_thinking: bool = True
 
     # --- 投递（核心：默认浮层） ---
     delivery: DeliveryMode = DeliveryMode.OVERLAY
@@ -272,6 +275,7 @@ def load_config(path: str = "config.yaml") -> Config:
     cfg.api_key = api.get("key", cfg.api_key)
     cfg.api_url = api.get("url", cfg.api_url)
     cfg.api_model = api.get("model", cfg.api_model)
+    cfg.api_no_thinking = bool(api.get("no_thinking", cfg.api_no_thinking))
     if not cfg.api_key:
         cfg = _load_api_from_keyfile(cfg, path)
 
