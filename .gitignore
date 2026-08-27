@@ -1,0 +1,50 @@
+# ===== 密钥 / 私密配置（绝不能入库）=====
+# 用通配 + 反选：aiKey_bak.txt / config.local.yaml / .env.local 这类顺手改名的
+# 副本同样挡住，只放行两个模板文件
+aiKey*.txt
+!aiKey.example.txt
+config*.yaml
+!config.example.yaml
+*.key
+.env
+.env.*
+
+# ===== 个人数据：面试题目、答案、复盘、浮层坐标 =====
+history/
+
+# ===== 内部待办清单（自述里带本机情况，不公开）=====
+待修改.md
+
+# ===== 构建产物（1.4GB 级别，走 Releases 而不是 git）=====
+build/
+dist/
+*.spec.bak
+*.exe
+
+# ===== OCR 模型缓存（约 200MB，首次运行自动下载）=====
+.paddle_cache/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ===== 测试产物 =====
+test_capture.png
+*.log
+*.bak
+
+# ===== 编辑器 / 系统 / AI 助手本地状态 =====
+.vscode/
+.idea/
+.claude/
+Thumbs.db
+desktop.ini
+*~
+
+# ===== 二进制文档（内容与 docs/技术方案.md 重复，想分发就挂 Release 附件）=====
+技术方案.docx
+*.docx

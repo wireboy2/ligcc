@@ -1,0 +1,13 @@
+apiKey=在这里填你的 API Key
+url=https://你的接口地址/v1/messages
+模型：claude-sonnet-4-5
+
+# 用法：把本文件复制为 aiKey.txt（与 README.md 同级，或放在 exe 同目录），
+#      再填上真实值。aiKey.txt 已被 .gitignore 排除，不会误提交。
+#
+# 说明：
+#   apiKey=  请求头会以 Authorization: Bearer <apiKey> 发送
+#   url=     Anthropic Messages 格式的端点（官方或兼容代理均可）
+#   模型：    模型名，中文冒号和英文冒号都认
+#
+# 也可以改用 config.yaml 的 api: { key/url/model } 段，优先级高于本文件。

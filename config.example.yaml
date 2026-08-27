@@ -1,0 +1,88 @@
+# config.example.yaml —— 复制为 config.yaml 后按需修改（全部字段都可省略，省略即用默认值）
+# 注意：config.yaml 已被 .gitignore 排除（可能含 API Key）。
+# 运行时用 python main.py --config config.yaml 指定，默认就读当前目录的 config.yaml。
+
+# ---------- 截屏 ----------
+# 截图显示器：1=主屏，2=副屏…，0=所有显示器合并的虚拟屏
+monitor: 1
+# 只截屏幕的某个矩形（left, top, right, bottom），留空=整块显示器
+# region: [100, 100, 1500, 900]
+# 目前只支持 mss。wgc（能抓被遮挡的窗口）尚未实现，
+# 写成 wgc 或别的值会打印一行提示并自动用 mss，不会报错
+capture_backend: mss
+
+# ---------- OCR（本地 PaddleOCR，不出网）----------
+ocr_lang: ch          # ch=中英文混合
+ocr_cpu_threads: 4    # CPU 推理线程数。调大 OCR 更快但鼠标会卡顿
+
+# ---------- 解答 ----------
+answer_mode: api      # api=调用下面配置的模型；none=只 OCR 不解答
+# API 配置。不写这一段时会自动去找 aiKey.txt（推荐用 aiKey.txt，别把 key 写这里）
+# api:
+#   key: sk-xxxx
+#   url: https://你的接口地址/v1/messages
+#   model: claude-sonnet-4-5
+
+# ---------- 答案投递方式 ----------
+delivery: overlay     # overlay=隐形浮层（默认）；clipboard=写剪贴板
+
+# ---------- 浮层 ----------
+overlay:
+  size: [820, 900]                  # 宽 x 高（像素）。最小 240x120，最大不超过显示器
+  #                                 # 工作区；写错（不是两个数）会打印一行提示并用默认值。
+  #                                 # 运行中可以按 Ctrl+Alt+Shift+方向键 调
+  fake_title: Windows Defender SmartScreen   # 伪装窗口标题
+  # 钉死浮层位置（屏幕坐标）。写了这一项就不再记忆拖动位置
+  # pos: [1200, 60]
+  remember_pos: true                # 记住拖动/停靠后的位置，以及热键调过的
+  #                                 # 字号/透明度/尺寸（存 history/overlay_state.json）
+  # 外观：写错（比如只给两个分量）会退回默认值，不会崩
+  bg_alpha: 165                     # 背板不透明度 0-255（0=全透明）
+  bg_color: [20, 22, 30]            # 背板 RGB
+  text_color: [235, 235, 235]       # 文字 RGB
+  # 字体：4K 屏或看不清时把 font_size 调大即可，行高会跟着按比例放大
+  font_size: 18                     # 字号（像素），8-96，越界自动夹住
+  # line_height: 26                 # 行高（像素）。留空=按字号 × 1.45 自动推算；
+  #                                 # 至少比字号大 2px，否则相邻行会咬在一起
+  font_name: Consolas               # 等宽字体名。装不到会自动退回 Consolas /
+  #                                 # Courier New，并在控制台提示一次
+  # 长行处理：默认按浮层可用宽度软换行（中英文按实际字宽算，代码续行保留缩进）。
+  # 改成 false 就回到旧行为——超出宽度的部分直接看不见
+  wrap: true
+
+# ---------- 隐蔽 ----------
+stealth:
+  fake_process_name: msbuild.exe    # 打包时的伪装进程名
+  no_focus_steal: true              # 浮层弹出时不抢焦点
+
+# ---------- 热键 ----------
+# 修饰键（Ctrl / Alt / Shift / Win，可多个）+ 一个主键：字母、数字、F1-F24、
+# Up/Down/Left/Right、Space、Esc、Enter、Tab、Home/End/PageUp/PageDown、
+# - = [ ] ; ' , . / \ ` 都行。大小写和空格随意，必须至少带一个修饰键
+# （裸键会在全局吞掉这个按键，连字都打不出来）。
+# 写错解析不了 → 打印提示并退回下面这套默认值。
+#
+# 注意：只有「还在用默认键」的项才会在被占用时自动换键
+#   （M→N→B、A→F→G、W→E→T、Ctrl+Alt+方向键→Ctrl+Alt+Shift+HJKL）；
+#   你显式写了什么就注册什么，被占用就直说不可用，不会擅自换成别的键。
+# 启动时控制台会打印本次实际生效的键，以那个为准。
+# hotkeys:
+#   solve:   Ctrl+Alt+Q      # 识别并解答
+#   append:  Ctrl+Alt+A      # 追加识别并合并解答
+#   toggle:  Ctrl+Alt+V      # 显示/隐藏浮层
+#   clear:   Ctrl+Alt+C      # 清空浮层
+#   monitor: Ctrl+Alt+M      # 切换截图显示器
+#   dock:    Ctrl+Alt+W      # 浮层停靠（四角/居中循环）
+#   font_up:    Ctrl+Alt+=   # 字号 +2
+#   font_down:  Ctrl+Alt+-   # 字号 -2
+#   alpha_down: Ctrl+Alt+[   # 背板更透
+#   alpha_up:   Ctrl+Alt+]   # 背板更实
+#   width_down:  Ctrl+Alt+Shift+Left    # 浮层变窄 60px（长行按新宽度重折）
+#   width_up:    Ctrl+Alt+Shift+Right   # 浮层变宽 60px
+#   height_down: Ctrl+Alt+Shift+Up      # 浮层变矮 60px
+#   height_up:   Ctrl+Alt+Shift+Down    # 浮层变高 60px
+#   move_left:  Ctrl+Alt+Left    # 浮层左移 20px（被 Intel 转屏占用会退到
+#   move_right: Ctrl+Alt+Right   #   Ctrl+Alt+Shift+H/J/K/L）
+#   move_up:    Ctrl+Alt+Up
+#   move_down:  Ctrl+Alt+Down
+#   quit:    Ctrl+Alt+X      # 退出

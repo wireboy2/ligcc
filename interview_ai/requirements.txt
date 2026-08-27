@@ -1,0 +1,23 @@
+# 截屏采集
+mss>=6.1.0
+numpy>=1.24.0
+
+# 图像处理
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# OCR（本地离线）
+paddleocr>=2.7.0
+paddlepaddle>=2.6.0
+
+# GUI（隐形窗口）
+pywin32>=306; sys_platform == "win32"
+
+# 配置
+pyyaml>=6.0
+
+# 剪贴板（clipboard 模式可选）
+pyperclip>=1.8.0
+
+# 打包
+pyinstaller>=6.0.0
