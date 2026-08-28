@@ -2,10 +2,11 @@
 config.py 的纯函数单测（任何平台可跑，不碰 Win32、不读真实配置）
 ================================================================
 
-这里只测两组「配错了也不该崩」的解析函数：
+这里只测那几组「配错了也不该崩」的解析函数：
 
   · parse_hotkey / format_hotkey —— 热键字符串 ⇄ (modifiers, vk)
-  · _color                       —— YAML 里的 [r, g, b]
+  · _color / _int                —— YAML 里的 [r, g, b] 与整数项
+  · input_mode / image 段        —— 输入模式（截图直发 ⇄ 本地 OCR）与截图编码参数
 
 它们的输入全部来自用户手写的 config.yaml，是最容易写错的地方；
 错值一路传下去会在 RegisterHotKey / GDI+ 的 ctypes 层报莫名其妙的错，
@@ -203,13 +204,51 @@ def main():
     eq("移动键与尺寸键不撞（尺寸那组带 Shift）",
        parse_hotkey(d.hotkey_move_left) != parse_hotkey(d.hotkey_width_down), True)
     names = ["solve", "toggle", "clear", "quit", "monitor", "append", "dock",
+             "input_mode",
              "font_up", "font_down", "alpha_down", "alpha_up",
              "width_down", "width_up", "height_down", "height_up",
              "move_left", "move_right", "move_up", "move_down"]
     combos = [parse_hotkey(getattr(d, f"hotkey_{n}")) for n in names]
-    eq("19 个默认热键两两不重复（否则后注册的必然失败）",
+    eq("20 个默认热键两两不重复（否则后注册的必然失败）",
        len(set(combos)), len(names))
     eq("每个默认热键都解析得出来", all(c for c in combos), True)
+
+    print()
+    print("=" * 66)
+    print("十一、输入模式：默认截图直发，OCR 一行配置切回来")
+    print("=" * 66)
+    from config import INPUT_MODES, IMAGE_FORMATS   # noqa: E402
+
+    eq("默认就是截图直发（image）", Config().input_mode, "image")
+    eq("只有两种模式，没有「都发」这一档", INPUT_MODES, ("image", "ocr"))
+    eq("input_mode: ocr 一行切回本地 OCR",
+       load("input_mode: ocr\n").input_mode, "ocr")
+    # 手误不该让整个程序起不来 —— 按下热键才发现配错了更糟
+    eq("写错 → 退回默认 image（打印一行提示，不抛异常）",
+       load("input_mode: iamge\n").input_mode, "image")
+    eq("留空 → 默认 image", load("input_mode:\n").input_mode, "image")
+
+    print()
+    print("=" * 66)
+    print("十二、image 段：截图编码参数（越界夹住、写错退默认）")
+    print("=" * 66)
+    c = load("image:\n  max_side: 1200\n  format: png\n  quality: 95\n")
+    eq("max_side", c.image_max_side, 1200)
+    eq("format", c.image_format, "png")
+    eq("quality", c.image_quality, 95)
+    eq("format 写错 → 默认 webp",
+       load("image:\n  format: bmp\n").image_format, "webp")
+    eq("max_side 越界夹住", load("image:\n  max_side: 99999\n").image_max_side, 4096)
+    eq("quality 越界夹住", load("image:\n  quality: 5\n").image_quality, 30)
+    # 写了 `image:` 却什么都不填，yaml 给的是 None —— 直接 .get 会 AttributeError
+    eq("空段等同于没写（不能崩）", load("image:\n").image_max_side,
+       Config().image_max_side)
+    eq("所有支持的格式都在编码表的键里", set(IMAGE_FORMATS),
+       {"webp", "png", "jpeg", "jpg"})
+    eq("输入模式切换热键默认 Ctrl+Alt+O",
+       parse_hotkey(Config().hotkey_input_mode), (CA, 0x4F))
+    eq("hotkeys.input_mode 能被 config 覆盖",
+       load("hotkeys:\n  input_mode: Ctrl+Alt+F8\n").hotkey_input_mode, "Ctrl+Alt+F8")
 
     print()
     print("=" * 66)

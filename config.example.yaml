@@ -15,12 +15,38 @@ monitor: 1
 # 写成 wgc 或别的值会打印一行提示并自动用 mss，不会报错
 capture_backend: mss
 
-# ---------- OCR（本地 PaddleOCR，不出网）----------
+# ---------- 输入模式：题目怎么送到模型面前（一行切换，两者互斥）----------
+# image（默认）截图连同提示词一次发给多模态模型。公式、图表、表格、代码缩进、
+#              选项框这些 OCR 拍平后就丢掉的信息全都还在，也不用装那 200MB
+#              本地模型；代价是每次上行一张几十~两百 KB 的图
+# ocr          先用本地 PaddleOCR 把题目识别成文字再问。出网只有几 KB 文本、
+#              断网也能识别，代价是丢版面信息、CPU 要跑 ~0.5s
+# 绝不会把 OCR 文本和截图一起发：同一道题喂两遍只会稀释注意力、加倍开销，
+# 而 OCR 那份本来就是图的有损投影。写错（比如 iamge）会打印一行并用 image。
+# 运行中按 Ctrl+Alt+O 可临时切换（不落盘，重启回到这里写的值）
+input_mode: image
+
+# ---------- 截图编码（只在 input_mode: image 时生效）----------
+image:
+  # 长边上限（像素）。端点自己会把 >1568 的图缩到 1568，本地先缩省的是上行
+  # 流量、换来的是首字更快；调小能再省流量，但字会开始糊
+  max_side: 1568
+  # webp | png | jpeg。webp 对「大片纯色背景 + 细小文字」的截屏压得最狠
+  # （同画质约为 png 的 1/5）。装的 opencv 没带 webp 编码器时会自动退到
+  # png / jpeg 并打印一行；写成别的值会退回 webp
+  format: webp
+  # webp / jpeg 的质量 1-100（png 忽略此项）。30-100 之外会被夹住。
+  # 80 对屏幕文本已经看不出损失，再往下调代码里的细小符号开始发虚
+  quality: 80
+
+# ---------- OCR（本地 PaddleOCR，不出网；只在 input_mode: ocr 时生效）----------
 ocr_lang: ch          # ch=中英文混合
 ocr_cpu_threads: 4    # CPU 推理线程数。调大 OCR 更快但鼠标会卡顿
 
 # ---------- 解答 ----------
-answer_mode: api      # api=调用下面配置的模型；none=只 OCR 不解答
+answer_mode: api      # api=调用下面配置的模型；none=只识别不解答
+#                     # 注意：none 只在 input_mode: ocr 下有意义 —— image 模式
+#                     # 本地一个字都不读，没有「识别结果」可以给你看
 # API 配置。不写这一段时会自动去找 aiKey.txt（推荐用 aiKey.txt，别把 key 写这里）
 # api:
 #   key: sk-xxxx
@@ -72,7 +98,7 @@ stealth:
 # 写错解析不了 → 打印提示并退回下面这套默认值。
 #
 # 注意：只有「还在用默认键」的项才会在被占用时自动换键
-#   （M→N→B、A→F→G、W→E→T、Ctrl+Alt+方向键→Ctrl+Alt+Shift+HJKL）；
+#   （M→N→B、A→F→G、W→E→T、O→Y→U、Ctrl+Alt+方向键→Ctrl+Alt+Shift+HJKL）；
 #   你显式写了什么就注册什么，被占用就直说不可用，不会擅自换成别的键。
 # 启动时控制台会打印本次实际生效的键，以那个为准。
 # hotkeys:
@@ -81,6 +107,8 @@ stealth:
 #   toggle:  Ctrl+Alt+V      # 显示/隐藏浮层
 #   clear:   Ctrl+Alt+C      # 清空浮层
 #   monitor: Ctrl+Alt+M      # 切换截图显示器
+#   input_mode: Ctrl+Alt+O   # 切换输入模式：截图直发 ⇄ 本地 OCR
+#   #                        #（被占用会退到 Ctrl+Alt+Y / Ctrl+Alt+U）
 #   dock:    Ctrl+Alt+W      # 浮层停靠（四角/居中循环）
 #   font_up:    Ctrl+Alt+=   # 字号 +2
 #   font_down:  Ctrl+Alt+-   # 字号 -2

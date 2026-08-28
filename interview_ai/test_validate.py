@@ -25,6 +25,10 @@
   C12. overlay 必须把长行交给 wrap_lines 软换行（否则右半边直接被裁掉）
   C13. main.run_once 的进度/失败必须走 _status（投浮层），不能只 print
   C14. main.run_once_cli 必须跑消息循环（否则 --once 下退出键/滚轮全是死的）
+  C15. config 默认 input_mode = image      （截图直发是主路径，OCR 退为可选）
+  C16. main 的图片模式必须走 imaging.encode_frame（编码只有一份实现）
+  C17. imaging.py 顶层不得 import 网络库   （编码模块不出网，出网只在 main）
+  C18. 两种输入模式互斥：绝不会把 OCR 文本和截图一起发
 """
 import ast
 import sys
@@ -109,6 +113,20 @@ def main():
     # main.py → config.DeliveryMode / load_config
     checks.append(("main → config.DeliveryMode", "DeliveryMode" in defined.get("config", set())))
     checks.append(("main → config.load_config", "load_config" in defined.get("config", set())))
+    checks.append(("main → config.INPUT_MODES（图片/OCR 两种输入模式）",
+                  "INPUT_MODES" in defined.get("config", set())))
+    # main.py → imaging.*（图片模式的编码与摘要）
+    checks.append(("main → imaging.encode_frame", "encode_frame" in defined.get("imaging", set())))
+    checks.append(("main → imaging.describe", "describe" in defined.get("imaging", set())))
+    # imaging 与 ocr 共用同一份画面指纹（两处各写一遍早晚对不上）
+    checks.append(("ocr → imaging.frame_fingerprint",
+                  "frame_fingerprint" in defined.get("imaging", set())
+                  and "frame_fingerprint" in (ROOT / "ocr.py").read_text(encoding="utf-8")))
+    # 图片模式的作答/存档入口（run_once 直接调，缺了就是按下热键才发现）
+    checks.append(("main.AnswerProvider.answer_from_shots",
+                  "AnswerProvider.answer_from_shots" in defined.get("main", set())))
+    checks.append(("main.AnswerProvider.refine_from_images",
+                  "AnswerProvider.refine_from_images" in defined.get("main", set())))
     # overlay → gdiplus_render.present
     checks.append(("overlay → gdiplus_render.present", "present" in defined.get("gdiplus_render", set())))
 
@@ -125,17 +143,22 @@ def main():
     config_src = (ROOT / "config.py").read_text(encoding="utf-8")
 
     # 提取 capture.py 的顶层 import 语句（只看真正 import 的网络库，忽略注释/字符串）
-    capture_tree = trees["capture"]
-    imported_names = set()
-    for node in capture_tree.body:
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imported_names.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imported_names.add(node.module.split(".")[0])
-    net_libs = {"requests", "httpx", "urllib3", "websocket", "socket"}
-    has_net_import = bool(imported_names & net_libs)
+    def toplevel_imports(tree: ast.Module) -> set[str]:
+        out = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for n in node.names:
+                    out.add(n.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    out.add(node.module.split(".")[0])
+        return out
+
+    net_libs = {"requests", "httpx", "urllib3", "urllib", "websocket", "socket"}
+    has_net_import = bool(toplevel_imports(trees["capture"]) & (net_libs - {"urllib"}))
+    # C17：imaging 只负责「把一帧编成能塞进请求的图片块」，出网是 main 的事。
+    #   编码模块一旦自己出网，「截图去了哪」就不再只有一处可查
+    imaging_net = bool(toplevel_imports(trees["imaging"]) & net_libs)
 
     # C1：overlay 代码里不得真正调用 SetLayeredWindowAttributes。
     #   正确的"每像素 alpha"走 UpdateLayeredWindow，根本不需要该函数；
@@ -213,6 +236,42 @@ def main():
             for s in ast.walk(once_fn)
         )
 
+    # C15/C16/C18：默认输入模式 = 截图直发，且两条路互斥。
+    #   C15 盯默认值：这是本次改动的主张，退回 ocr 就等于改动没生效。
+    #   C16 盯「图片编码只有一份实现」：main 自己 base64 拼一遍，缩放/退化链/
+    #       指纹去重就会悄悄少一半。
+    #   C18 盯互斥：同一道题图文各发一遍会稀释注意力、加倍开销，而 OCR 那份
+    #       本来就是图的有损投影 —— 所以两个 _recognize_* 必须各自清空对方的
+    #       累积，且拼图片请求的地方不能碰 OCR 文本。
+    def func_in(stem: str, name: str):
+        for node in ast.walk(trees[stem]):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        return None
+
+    def attrs_used(fn, ctx=None) -> set[str]:
+        """函数里用到的 self.xxx 属性名（ctx=ast.Store 只看被赋值的）。"""
+        out = set()
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Attribute) and (ctx is None
+                                                   or isinstance(sub.ctx, ctx)):
+                out.add(sub.attr)
+        return out
+
+    default_input_image = 'input_mode: str = "image"' in config_src
+    rec_img, rec_ocr = func_in("main", "_recognize_image"), func_in("main", "_recognize_ocr")
+    img_content = func_in("main", "image_content")
+    uses_encode_frame = rec_img is not None and any(
+        isinstance(s, ast.Call) and isinstance(s.func, ast.Attribute)
+        and s.func.attr == "encode_frame" for s in ast.walk(rec_img))
+    # 各自清空对方的累积（不清 → 下一次追加就把两种题面凑一起发出去）
+    img_clears_text = rec_img is not None and "_passes" in attrs_used(rec_img, ast.Store)
+    ocr_clears_shots = rec_ocr is not None and "_shots" in attrs_used(rec_ocr, ast.Store)
+    # 拼图片请求的地方一个字 OCR 文本都不该碰
+    img_req_clean = img_content is not None and not (
+        attrs_used(img_content) & {"_passes", "text"})
+    mutually_exclusive = img_clears_text and ocr_clears_shots and img_req_clean
+
     constraints = [
         ("C1  overlay 无 LWA_COLORKEY 调用（走 UpdateLayeredWindow 每像素 alpha）",
          not has_colorkey_call and "UpdateLayeredWindow" in gdi_src),
@@ -234,6 +293,11 @@ def main():
          has_status and status_calls >= 4),
         ("C14 run_once_cli 跑消息循环，非 while True 空转",
          once_pumps and not once_busy_wait),
+        ("C15 config 默认 input_mode = image（截图直发是主路径）", default_input_image),
+        ("C16 图片模式走 imaging.encode_frame（编码只有一份实现）", uses_encode_frame),
+        ("C17 imaging 顶层 import 无网络库（出网只在 main）", not imaging_net),
+        ("C18 两种输入模式互斥（切换清空对方累积，图片请求不带 OCR 文本）",
+         mutually_exclusive),
     ]
     for name, ok in constraints:
         print(f"  {'✅' if ok else '❌'} {name}")

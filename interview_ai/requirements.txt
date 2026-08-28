@@ -6,9 +6,12 @@ numpy>=1.24.0
 opencv-python>=4.8.0
 Pillow>=10.0.0
 
-# OCR（本地离线）
-paddleocr>=2.7.0
-paddlepaddle>=2.6.0
+# OCR（本地离线）—— 只有 input_mode: ocr 需要。默认的 image 模式（截图直发）
+# 用不到这两个包，它们又是全部依赖里最大的一坨（约 1GB 装机 + 200MB 模型）。
+# 只想用默认模式、想装得轻一点的话，把下面两行注释掉即可；之后再想切回 OCR
+# 就 pip install paddleocr paddlepaddle。切模式本身不需要重装任何东西。
+# paddleocr>=2.7.0
+# paddlepaddle>=2.6.0
 
 # GUI（隐形窗口）
 pywin32>=306; sys_platform == "win32"

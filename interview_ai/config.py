@@ -13,6 +13,14 @@ class DeliveryMode(Enum):
     CLIPBOARD = "clipboard" # 剪贴板（辅助/兼容）
 
 
+# 输入模式：题目怎么送到模型面前。两者**互斥**，不存在「都发」这种选项 ——
+# 同一道题喂两遍（图 + OCR 文本）只会稀释注意力、加倍图片与 token 开销，
+# 而 OCR 那份本来就是图的有损投影。
+INPUT_MODES = ("image", "ocr")
+# 截图编码格式（imaging.FORMATS 的键）。写别的会退回默认并打印一行。
+IMAGE_FORMATS = ("webp", "png", "jpeg", "jpg")
+
+
 @dataclass
 class Config:
     # --- 截屏 ---
@@ -20,7 +28,21 @@ class Config:
     capture_backend: str = "mss"                     # mss | wgc
     monitor: int = 1                                 # 截图显示器：1=主屏 2=副屏… 0=全部合并
 
-    # --- OCR ---
+    # --- 输入模式（默认：截图直接交给多模态模型）---
+    # image = 截屏 + 提示词一次发给模型（默认）。公式/图表/表格/代码缩进/选项
+    #         框这些 OCR 拍平后就没了的信息都还在，也不需要本地那 200MB 模型
+    # ocr   = 先用本地 PaddleOCR 把题目识别成文字再问。出网只有几 KB 文本、
+    #         断网也能识别，代价是丢版面信息、CPU 要跑 ~0.5s
+    # 运行中还能用 hotkey_input_mode 临时切（不落盘，重启回到这里写的值）
+    input_mode: str = "image"
+
+    # --- 截图编码（只在 input_mode=image 时生效）---
+    # 长边上限：端点自己会把 >1568 的图缩到 1568，本地先缩省的是上行流量
+    image_max_side: int = 1568
+    image_format: str = "webp"    # webp | png | jpeg（编不出来会自动退化）
+    image_quality: int = 80       # webp/jpeg 质量 1-100；png 忽略
+
+    # --- OCR（只在 input_mode=ocr 时生效）---
     ocr_lang: str = "ch"             # PaddleOCR 语言代码（ch=中英文混合）
     ocr_cpu_threads: int = 4         # CPU 推理线程数（过大 OCR 时鼠标会卡）
 
@@ -65,6 +87,8 @@ class Config:
     hotkey_monitor: str = "Ctrl+Alt+M"
     hotkey_append: str = "Ctrl+Alt+A"
     hotkey_dock: str = "Ctrl+Alt+W"
+    # 输入模式切换：截图直发 ⇄ 本地 OCR（现场发现某一屏识别得不好就按一下）
+    hotkey_input_mode: str = "Ctrl+Alt+O"
     # 观感微调：字号 +/-，背板透明度 [/]（现场调一下就好，不必改配置重启）
     hotkey_font_up: str = "Ctrl+Alt+="
     hotkey_font_down: str = "Ctrl+Alt+-"
@@ -248,6 +272,28 @@ def _int(v, default, lo: int, hi: int):
         return default
 
 
+def _choice(v, allowed: tuple[str, ...], default: str, label: str) -> str:
+    """枚举型字符串项：写错就打印一行并退回 default。
+
+    刻意不抛异常：`input_mode: iamge` 这种手误不该让整个程序起不来 ——
+    按下热键才发现配错了更糟，所以启动时就把话说清楚然后照常跑。
+    """
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in allowed:
+        return s
+    print(f"[config] {label}={v!r} 不是 {'/'.join(allowed)} 之一，用默认 {default}")
+    return default
+
+
+def _section(data: dict, key: str) -> dict:
+    """取 YAML 的一个子段。写了 `image:` 却什么都不填时 yaml 给的是 None，
+    直接 .get 会 AttributeError —— 空段等同于没写。"""
+    v = data.get(key)
+    return v if isinstance(v, dict) else {}
+
+
 def load_config(path: str = "config.yaml") -> Config:
     cfg = Config()
     p = Path(path)
@@ -266,12 +312,21 @@ def load_config(path: str = "config.yaml") -> Config:
     cfg.region = get("region", cfg.region)
     cfg.capture_backend = get("capture_backend", cfg.capture_backend)
     cfg.monitor = int(get("monitor", cfg.monitor))
+    cfg.input_mode = _choice(get("input_mode", cfg.input_mode), INPUT_MODES,
+                             cfg.input_mode, "input_mode")
+
+    img = _section(data, "image")
+    cfg.image_max_side = _int(img.get("max_side"), cfg.image_max_side, 320, 4096)
+    cfg.image_format = _choice(img.get("format"), IMAGE_FORMATS,
+                               cfg.image_format, "image.format")
+    cfg.image_quality = _int(img.get("quality"), cfg.image_quality, 30, 100)
+
     cfg.ocr_lang = get("ocr_lang", cfg.ocr_lang)
     cfg.ocr_cpu_threads = int(get("ocr_cpu_threads", cfg.ocr_cpu_threads))
     cfg.answer_mode = get("answer_mode", cfg.answer_mode)
 
     # API 配置（优先从 config.yaml 读，兜底从 aiKey.txt 读）
-    api = data.get("api", {})
+    api = _section(data, "api")
     cfg.api_key = api.get("key", cfg.api_key)
     cfg.api_url = api.get("url", cfg.api_url)
     cfg.api_model = api.get("model", cfg.api_model)
@@ -282,7 +337,7 @@ def load_config(path: str = "config.yaml") -> Config:
     delivery = get("delivery", "overlay")
     cfg.delivery = DeliveryMode(delivery) if delivery else cfg.delivery
 
-    ov = data.get("overlay", {})
+    ov = _section(data, "overlay")
     # size 写错（不是两个正整数）就退回默认：这个值会一路传到 CreateWindowEx，
     # 在那里报错比在这里退回默认难查得多。下限跟 overlay.MIN_W/MIN_H 一致
     size = ov.get("size")
@@ -309,12 +364,13 @@ def load_config(path: str = "config.yaml") -> Config:
     cfg.overlay_pos = tuple(pos) if isinstance(pos, (list, tuple)) and len(pos) == 2 else None
     cfg.overlay_remember_pos = bool(ov.get("remember_pos", cfg.overlay_remember_pos))
 
-    stealth = data.get("stealth", {})
+    stealth = _section(data, "stealth")
     cfg.fake_process_name = stealth.get("fake_process_name", cfg.fake_process_name)
     cfg.no_focus_steal = stealth.get("no_focus_steal", cfg.no_focus_steal)
 
-    hk = data.get("hotkeys", {})
+    hk = _section(data, "hotkeys")
     for k in ("solve", "toggle", "clear", "quit", "monitor", "append", "dock",
+              "input_mode",
               "font_up", "font_down", "alpha_down", "alpha_up",
               "width_down", "width_up", "height_down", "height_up",
               "move_left", "move_right", "move_up", "move_down"):

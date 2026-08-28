@@ -1,12 +1,21 @@
 """
-主流程：截屏 → OCR → 作答 → 隐形浮层（主）/ 剪贴板（辅）
+主流程：截屏 → 识别（截图直发 / 本地 OCR）→ 作答 → 隐形浮层（主）/ 剪贴板（辅）
 ==================================================================
 
 架构
 ----
-识别线程（capture + ocr）持续扫描屏幕上的题目；
-答案生成后，默认投递到 StealthOverlay（你照着抄）；
-可通过 --delivery clipboard 切换到剪贴板模式。
+按下热键抓一帧屏幕 → 按 `input_mode` 决定题目怎么送到模型面前 →
+答案默认投递到 StealthOverlay（你照着抄），也可 --delivery clipboard 写剪贴板。
+
+两种输入模式（config.yaml 的 `input_mode`，**互斥**，一键切换）
+--------------------------------------------------------------
+  image（默认）截图连同提示词一次发给多模态模型。公式、图表、表格、代码
+               缩进、选项框这些 OCR 拍平后就丢掉的信息全都还在，也不必装
+               那 200MB 本地模型；代价是每次上行一张几十~两百 KB 的图
+  ocr          先用本地 PaddleOCR 把题目识别成文字再问。出网只有几 KB 文本、
+               断网也能识别，代价是丢版面信息、CPU 要跑 ~0.5s
+  绝不会把 OCR 文本和截图一起发：同一道题喂两遍只会稀释注意力、加倍开销，
+  而 OCR 那份本来就是图的有损投影。
 
 热键（默认，可在 config.yaml 改）
 ---------------------------------
@@ -15,6 +24,7 @@
   Ctrl+Alt+V   显示 / 隐藏浮层
   Ctrl+Alt+C   清空浮层内容
   Ctrl+Alt+M   切换截图显示器（多屏循环，浮层跟随）
+  Ctrl+Alt+O   切换输入模式：截图直发 ⇄ 本地 OCR
   Ctrl+Alt+W   浮层停靠：右上→右下→左下→左上→居中（拖丢了用它拉回来）
   Ctrl+Alt+= / -   字号 +2 / -2（长行立刻按新字号重折）
   Ctrl+Alt+[ / ]   背板更透 / 更实（每次 15/255）
@@ -37,7 +47,8 @@
   2. WS_EX_TOOLWINDOW → 不出现在 Alt-Tab / 任务栏
   3. WS_EX_NOACTIVATE + SW_SHOWNOACTIVATE → 弹出时不抢焦点，
      避免浏览器/会议窗口失去焦点触发 blur 日志
-  4. OCR 本地推理（PaddleOCR）；解答走 API（配置见 aiKey.txt 或 config.yaml）
+  4. 解答走 API（配置见 aiKey.txt 或 config.yaml）；
+     `input_mode: ocr` 时识别在本地（PaddleOCR），出网只有几 KB 文本
   5. 进程名/窗口标题伪装（build.bat 打包为 msbuild.exe 等）
 
 API 配置
@@ -48,9 +59,10 @@ API 配置
 运行
 ----
   pip install -r requirements.txt
-  python main.py --once                      # 验证：截屏+OCR+解答 一次
+  python main.py --once                      # 验证：截屏+解答 一次
   python main.py --once --duration 30        # 同上，看 30 秒自动关（不用 Ctrl+C）
   python main.py                             # 完整热键循环（推荐）
+  python main.py --input-mode ocr            # 这次用本地 OCR（默认截图直发）
   python main.py --delivery clipboard        # 答案写剪贴板（默认仍是 overlay）
 
 仅 Windows 可用。
@@ -61,6 +73,7 @@ import os
 import sys
 import time
 import threading
+from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator
 
 # PaddleOCR 模型缓存重定向：
@@ -87,10 +100,11 @@ if sys.platform == "win32":
         pass
 
 from capture import ScreenCapturer, CaptureRegion
+import imaging
 from ocr import OCR, models_cached
 from overlay import (StealthOverlay, check_system, load_saved_monitor,
                      load_saved_pos, load_saved_size, load_state, save_monitor)
-from config import load_config, DeliveryMode, Config as _CfgDefaults
+from config import load_config, DeliveryMode, INPUT_MODES, Config as _CfgDefaults
 from history import QALog
 
 import json
@@ -255,9 +269,34 @@ class StreamSink:
 # ---------------------------------------------------------------------------
 class AnswerProvider:
     """
-    把 OCR 出的题目文本 → 答案文本。
-    通过配置的 Claude API 接口完成解答。
+    题目 → 答案文本。通过配置的 Claude API 接口完成解答。
+
+    题目有两种送法，**互斥**（见 config.INPUT_MODES）：
+      · answer_from_shots(...)  截图直接发（默认）—— 图片块 + 提示词
+      · answer_from_passes(...) 本地 OCR 出的文字发 —— 纯文本提示词
+    两条路最后都汇到 _answer_with_retry / _call_api，重试、流式、关思考、
+    端点脾气兼容那些逻辑只有一份。
     """
+
+    # 解答提示词。图片版必须明写「忽略界面元素」：截图里除了题目还有地址栏、
+    # 导航、行号、状态栏、系统时间、通过率 —— OCR 模式下这些噪音是靠
+    # refine 的清单事后清理的，图片模式直接在提问时就划清范围。
+    PROMPT_TEXT = ("你是一个面试/编程题解答助手。请直接给出简洁准确的答案，"
+                   "如果是代码题请给出完整可运行的代码。")
+    PROMPT_IMAGE = (
+        "你是一个面试/编程题解答助手。上面是屏幕截图，题目就在图里。\n"
+        "请忽略与题目无关的界面元素：窗口标题、地址栏、导航栏与标签、登录/会员提示、"
+        "通过率/在线人数等网站统计、编辑器行号、状态栏（如「行7，列3」）、系统时间。\n"
+        "直接给出简洁准确的答案；如果是代码题请给出完整可运行的代码。"
+    )
+    PROMPT_IMAGE_MULTI = (
+        "你是一个面试/编程题解答助手。上面几张截图是【同一道题目】的不同部分"
+        "（题目较长，分几次截取，各图之间可能有内容重叠或顺序交错）。\n"
+        "请先把它们合并还原成一道完整的题目（在心中去重对齐，不要输出合并过程），"
+        "并忽略与题目无关的界面元素：窗口标题、地址栏、导航栏与标签、登录/会员提示、"
+        "通过率/在线人数等网站统计、编辑器行号、状态栏（如「行7，列3」）、系统时间。\n"
+        "然后直接给出简洁准确的答案；如果是代码题请给出完整可运行的代码。"
+    )
 
     def __init__(self, mode: str = "api", api_key: str = "", api_url: str = "",
                  model: str = "", no_thinking: bool = True):
@@ -286,6 +325,39 @@ class AnswerProvider:
         """单次识别文本 → 答案。on_text 见 collect_sse_answer（流式增量回调）。"""
         return self._answer_with_retry(question, on_text)
 
+    # -------- 图片模式（默认）--------
+    @classmethod
+    def image_content(cls, shots: list) -> list:
+        """一串 imaging.Shot → Messages API 的 content blocks。
+
+        顺序是「图在前、提示词在后」：官方建议单图这么放效果最好；多图时
+        每张前面加一行【第 N 张】标签，模型引用某一张时不至于指代不清。
+        """
+        blocks: list = []
+        multi = len(shots) > 1
+        for i, shot in enumerate(shots, 1):
+            if multi:
+                blocks.append({"type": "text", "text": f"【第 {i} 张截图】"})
+            blocks.append(shot.to_block())
+        blocks.append({"type": "text",
+                       "text": cls.PROMPT_IMAGE_MULTI if multi else cls.PROMPT_IMAGE})
+        return blocks
+
+    def answer_from_shots(self, shots: list,
+                          on_text: Callable[[str], None] | None = None) -> str:
+        """截图（一张或多张）→ 答案。**不带任何 OCR 文本**。
+
+        多张的场景与 answer_from_passes 一样：长题一屏截不完，按追加键
+        再截一张，让模型把几张当同一道题合并作答。
+        """
+        valid = [s for s in shots if s is not None]
+        if not valid:
+            return ""
+        return self._answer_with_retry(
+            self.image_content(valid), on_text,
+            recap=f"【已采集 {len(valid)} 张截图，未能送达】")
+
+    # -------- OCR 文本模式 --------
     def answer_from_passes(self, passes: list[str],
                            on_text: Callable[[str], None] | None = None) -> str:
         """
@@ -313,20 +385,31 @@ class AnswerProvider:
         )
         return self._answer_with_retry(merged, on_text)
 
-    def _answer_with_retry(self, question: str,
-                           on_text: Callable[[str], None] | None = None) -> str:
-        if not question.strip():
+    def _answer_with_retry(self, content: str | list,
+                           on_text: Callable[[str], None] | None = None,
+                           recap: str = "") -> str:
+        """
+        :param content: str = OCR 文本模式的题目；list = 图文混合 content blocks
+        :param recap: 失败时附在错误信息前的「这次拿到了什么」。文本模式默认
+                      把识别到的题目原样带上（不至于白识别一遍）；图片模式
+                      没有文本可带，只能说明采了几张
+        """
+        if isinstance(content, str):
+            if not content.strip():
+                return ""
+            recap = recap or f"【识别到的题目】\n{content}"
+        elif not content:
             return ""
         if self.mode == "none":
             return ""
         if not self.api_key or not self.api_url:
-            return f"【识别到的题目】\n{question}\n\n【错误】未配置 API 密钥或地址"
+            return f"{recap}\n\n【错误】未配置 API 密钥或地址"
 
         # 代理网络不稳定（间歇性 SSL 中断/403），带重试
         last_err = None
         for attempt in range(3):
             try:
-                return self._call_claude(question, on_text)
+                return self._call_claude(content, on_text)
             except StreamInterrupted as e:
                 # 已经流出来的半页答案比「从头再来」有用：用户正照着抄，
                 # 把浮层推回开头等于让他白抄一遍。所以不重试，保留 + 标一行
@@ -340,38 +423,69 @@ class AnswerProvider:
                     self._say(f"模型调用失败，{wait}s 后重试"
                               f"（第 {attempt + 2}/3 次）…\n\n{e}")
                     time.sleep(wait)
-        return f"【识别到的题目】\n{question}\n\n【API 调用失败】{last_err}"
+        return f"{recap}\n\n【API 调用失败】{last_err}"
+
+    # -------- 复盘存档的 AI 整理 --------
+    # 两种模式共用的整理规则：图片模式下模型看的是截图，OCR 模式下看的是
+    # 识别文本，但「什么算界面噪音、什么必须保留」是同一套。
+    REFINE_RULES = (
+        "题目只保留题目本身，必须剔除以下界面噪音：\n"
+        "- 窗口标题、地址栏 URL、导航栏、登录/会员提示、通过率/在线人数等网站统计\n"
+        "- 编辑器/代码区的行号（单独成行的数字）\n"
+        "- 状态栏信息（如「行7，列3」「已存储」）、系统时间（如 22:51、2026/8/26）\n"
+        "- 孤立符号与碎字：单独成行、与题目无关的 X × □ ☆ ♡ ∈ ● c T 之类无意义字符\n"
+        "保留：题号与题名、完整题目描述、示例（输入/输出/解释）、数据范围与约束、进阶提问。\n"
+        "答案保留核心解题思路与完整代码，去掉口语化开场白，层次清晰。\n"
+        "严格只输出一个 JSON 对象，不要任何其它文字或代码块标记：\n"
+        '{"question": "整理后的题目", "answer": "整理后的答案"}'
+    )
 
     def refine_for_history(self, question: str, answer: str) -> tuple[str, str] | None:
         """
-        调用 AI 把原始题目/答案整理成规范存档格式（复盘用）。
+        调用 AI 把原始题目/答案整理成规范存档格式（复盘用，OCR 模式）。
 
         :return: (整理后的题目, 整理后的答案)；失败/未配置返回 None
                  （调用方保留原始记录，不丢数据）
         """
-        if self.mode == "none" or not self.api_key or not self.api_url:
-            return None
         if not (question.strip() and answer.strip()):
             return None
         prompt = (
             "请把下面这道面试/编程题的题目和答案整理成规范的复盘存档格式。\n"
-            "题目只保留题目本身，必须剔除以下界面噪音（OCR 从网页截屏带进来的）：\n"
-            "- 窗口标题、地址栏 URL、导航栏、登录/会员提示、通过率/在线人数等网站统计\n"
-            "- 编辑器/代码区的行号（单独成行的数字）\n"
-            "- 状态栏信息（如「行7，列3」「已存储」）、系统时间（如 22:51、2026/8/26）\n"
-            "- OCR 产生的孤立符号与碎字：单独成行、与题目无关的 X × □ ☆ ♡ ∈ ● c T 之类无意义字符\n"
-            "保留：题号与题名、完整题目描述、示例（输入/输出/解释）、数据范围与约束、进阶提问。\n"
-            "答案保留核心解题思路与完整代码，去掉口语化开场白，层次清晰。\n"
-            "严格只输出一个 JSON 对象，不要任何其它文字或代码块标记：\n"
-            '{"question": "整理后的题目", "answer": "整理后的答案"}\n\n'
+            "（题目是 OCR 从网页截屏识别来的，带界面噪音）\n"
+            + self.REFINE_RULES + "\n\n"
             f"【原始题目（多次 OCR 识别拼接）】\n{question}\n\n"
             f"【原始答案】\n{answer}"
         )
+        return self._refine_call(prompt)
+
+    def refine_from_images(self, shots: list, answer: str) -> tuple[str, str] | None:
+        """
+        图片模式的存档整理：让模型**从截图里读出题面**，连同答案整理成
+        规范格式。
+
+        图片模式本地没有任何题目文本，不做这一步的话复盘记录里就只有答案、
+        没有题目 —— 复盘时看着答案猜题目，等于这条记录白存了。
+        """
+        valid = [s for s in shots if s is not None]
+        if not valid or not answer.strip():
+            return None
+        content: list = list(self.image_content(valid)[:-1])   # 去掉解答提示词
+        content.append({"type": "text", "text": (
+            "请根据上面的屏幕截图，把这道面试/编程题的题目和下面给出的答案"
+            "整理成规范的复盘存档格式。\n" + self.REFINE_RULES + "\n\n"
+            f"【已生成的答案】\n{answer}"
+        )})
+        return self._refine_call(content)
+
+    def _refine_call(self, content: str | list) -> tuple[str, str] | None:
+        """整理请求的公共部分：未配置就不发，失败重试 3 次，解析 JSON。"""
+        if self.mode == "none" or not self.api_key or not self.api_url:
+            return None
         last_err = None
         for attempt in range(3):
             try:
                 # 整理输出含完整代码块，给更大输出预算防截断
-                text = self._call_api(prompt, max_tokens=8192)
+                text = self._call_api(content, max_tokens=8192)
                 return self._parse_qa_json(text)
             except Exception as e:
                 last_err = e
@@ -417,14 +531,17 @@ class AnswerProvider:
                     return q, a
         return None
 
-    def _call_claude(self, question: str,
+    def _call_claude(self, question: str | list,
                      on_text: Callable[[str], None] | None = None) -> str:
-        """解答入口：拼解答提示词后调用 API。"""
-        content = (
-            "你是一个面试/编程题解答助手。请直接给出简洁准确的答案，"
-            "如果是代码题请给出完整可运行的代码。\n\n"
-            f"题目：\n{question}"
-        )
+        """解答入口：一次调用 = 一道题。
+
+        str  → OCR 文本模式，在这里拼上解答提示词；
+        list → 图片模式，content blocks 由 image_content() 拼好（提示词已在里面），
+               原样送出。
+        """
+        if not isinstance(question, str):
+            return self._call_api(question, on_text=on_text)
+        content = f"{self.PROMPT_TEXT}\n\n题目：\n{question}"
         return self._call_api(content, on_text=on_text)
 
     # 空闲超时（秒）。urlopen 的 timeout 是**单次 socket 读**的超时，不是整轮
@@ -434,10 +551,12 @@ class AnswerProvider:
     # 最后浮层上写「API 调用失败」—— 答案其实一直好好地在路上。
     IDLE_TIMEOUT = 180
 
-    def _call_api(self, content: str, max_tokens: int = 4096,
+    def _call_api(self, content: str | list, max_tokens: int = 4096,
                   on_text: Callable[[str], None] | None = None) -> str:
-        """流式调用 Claude Messages API（content 即完整 user 消息）。
+        """流式调用 Claude Messages API。
 
+        :param content: 完整的 user 消息 —— str（纯文本）或 content blocks 列表
+                        （图片模式，见 image_content）。Messages API 两种都收。
         :param on_text: 增量回调，见 collect_sse_answer。None 也照样走流式 ——
                         流式顺手解决了长答案在 60s 处超时那个坑（见
                         IDLE_TIMEOUT），后台整理历史记录同样受益。
@@ -532,6 +651,31 @@ class AnswerProvider:
 # ---------------------------------------------------------------------------
 # 主应用
 # ---------------------------------------------------------------------------
+# 图片模式落盘时的题面占位（本地一个字都没读，没有题面文本可存）。真正的
+# 题面由后台 refine_from_images 从截图里读出来后覆盖；那一步失败的话记录里
+# 就留着这行占位 —— `--refine` 靠这个前缀认出「这条已经补不回来了」（截图
+# 不落盘，见 README 的已知限制），跳过而不是拿占位文本去瞎整理一遍。
+IMAGE_Q_PREFIX = "（image 模式："
+
+
+def image_placeholder_question(n: int) -> str:
+    return f"{IMAGE_Q_PREFIX}{n} 张截图直接送模型，题面待 AI 从截图整理）"
+
+
+@dataclass
+class Recognized:
+    """一次「把屏幕变成可以提问的东西」的结果 —— 两种输入模式的统一交付物。
+
+    有了它，run_once 就不必知道这一轮是图还是文字：拿 summary 报进度、
+    拿 question 落盘、拿 conf 记 OCR 置信度，剩下的差异全在两个
+    _recognize_* 里面。
+    """
+    summary: str                # 一句话进度（「已采集 2 张截图（1568x882，共 210KB）」）
+    question: str               # 存进复盘记录的题面；图片模式本地没有文本 → 占位
+    conf: float | None = None   # OCR 平均置信度；图片模式为 None
+    count: int = 1              # 本轮累积了几段/几张（存 passes 字段）
+
+
 class App:
     # 键盘微调浮层位置的步长（像素）：20px 一次，按十几下就能横跨半屏，
     # 又足够细，摆到「刚好不挡住题目」的位置
@@ -543,6 +687,8 @@ class App:
             self.cfg.delivery = DeliveryMode(args.delivery)
         if args.answer_mode:
             self.cfg.answer_mode = args.answer_mode
+        if getattr(args, "input_mode", None):
+            self.cfg.input_mode = args.input_mode
         # 「显式指定了截图屏」= 命令行给了 --monitor，或 config.yaml 里写了非默认值。
         # 这两种都是「钉死」的意思，不该被上次记住的截图屏盖掉（与 size/字号同一套规矩）
         explicit_monitor = (args.monitor is not None
@@ -564,7 +710,16 @@ class App:
             backend=self.cfg.capture_backend,
             monitor=self.cfg.monitor,
         )
-        self.ocr = OCR(lang=self.cfg.ocr_lang, cpu_threads=self.cfg.ocr_cpu_threads)
+        # OCR 按需构造：默认的图片模式根本不需要它，提前 new 出来等于让每次
+        # 启动都白背一个 200MB 模型的下载/加载入口（懒加载在 OCR 内部，
+        # 但 config 里的 lang/threads 也没必要在图片模式下生效）
+        self.ocr: OCR | None = self._new_ocr() if self.cfg.input_mode == "ocr" else None
+        print(f"[input] 输入模式: {self._mode_label(self.cfg.input_mode)}"
+              + (f"（{self.cfg.image_format} / 长边≤{self.cfg.image_max_side}px / "
+                 f"质量 {self.cfg.image_quality}）"
+                 if self.cfg.input_mode == "image"
+                 else f"（PaddleOCR lang={self.cfg.ocr_lang} "
+                      f"{self.cfg.ocr_cpu_threads} 线程）"))
         self.answerer = AnswerProvider(
             mode=self.cfg.answer_mode,
             api_key=self.cfg.api_key,
@@ -643,6 +798,8 @@ class App:
         self._hotkey_labels: dict[str, str] = {}
         # 多次识别合并：累积的各次 OCR 文本（同一道题的不同部分）
         self._passes: list[str] = []
+        # 图片模式的对应物：累积的各张截图（imaging.Shot）
+        self._shots: list = []
         # 复盘存储：每道题一条记录；Q=新题新记录，A=更新当前记录
         self.qa_log = QALog()
         self._entry_id = self.qa_log.next_id()
@@ -662,6 +819,23 @@ class App:
             return None
         left, top, right, bottom = region
         return CaptureRegion(left, top, right - left, bottom - top)
+
+    @staticmethod
+    def _mode_label(mode: str) -> str:
+        """输入模式的人话（控制台和浮层提示都用它，两处说法不会打架）。"""
+        return "image（截图直发多模态模型）" if mode == "image" else "ocr（本地 PaddleOCR）"
+
+    def _new_ocr(self) -> OCR:
+        return OCR(lang=self.cfg.ocr_lang, cpu_threads=self.cfg.ocr_cpu_threads)
+
+    def _ensure_ocr(self) -> OCR:
+        """要用 OCR 了才把它建出来（启动在图片模式、中途切过来的情况）。
+
+        只是建对象，不加载模型 —— 模型仍然是首次 recognize 时才加载。
+        """
+        if self.ocr is None:
+            self.ocr = self._new_ocr()
+        return self.ocr
 
     # ------------------------------------------------------------------ 状态反馈
     def _key(self, name: str) -> str:
@@ -697,60 +871,55 @@ class App:
         :param append: False=按 Q，清空之前的累积、只按本次识别作答；
                        True=按追加键，把本次识别并入之前的累积，
                        让 AI 把多次识别当同一道题合并作答。
+
+        题目怎么送到模型面前由 `input_mode` 决定（image=截图直发，默认；
+        ocr=本地识别成文字）。模式在这里读一次就固定住：一轮解答中途被
+        热键切了模式，会变成「用图识别、按文字作答」这种对不上的组合。
         """
-        self._status("识别中…", "ocr")
+        mode = self.cfg.input_mode
+        self._status("截屏中…" if mode == "image" else "识别中…",
+                     "capture" if mode == "image" else "ocr")
         frame = self.capturer.grab()
         if frame is None:
             self._status(f"截屏失败。多屏的话按 {self._key('monitor')} 换一块屏再试。",
                          "capture")
             return ""
-        if not self.ocr.loaded:
-            # 模型是懒加载的：真正的下载/初始化就发生在下面这次 recognize 里。
-            # 首次可能要拉 200MB，paddle 的进度条只进它自己的 stdout，
-            # 无控制台版看起来就是卡死 —— 所以先把话说在前头
-            if models_cached():
-                self._status("首次识别：正在加载 OCR 模型，约十几秒…", "ocr")
-            else:
-                self._status("首次运行：正在下载 OCR 模型（约 200MB）…\n\n"
-                             "存到 .paddle_cache/ 里，视网速要几分钟。"
-                             "下完这一次，以后启动就不用等了。", "ocr")
-        try:
-            result = self.ocr.recognize(frame)
-        except Exception as e:
-            self._status(f"OCR 失败：{type(e).__name__}: {e}\n\n"
-                         "首次运行时多半是模型没下完（网络问题），再按一次重试。", "ocr")
-            return ""
-        print(f"---- OCR 识别结果 (conf={result.confidence:.2f} "
-              f"{result.elapsed_ms:.0f}ms) ----")
-        print(result.text[:1000])
-        if not result.text.strip():
-            # 最常见的原因就是截错屏（题目在另一块显示器上），所以直接把
-            # 换屏热键写在提示里，不用去翻文档
-            self._status(f"这一屏没识别到文字。题目可能在另一块显示器上"
-                         f"（{self._key('monitor')} 换屏），或者字太小/对比度太低。", "ocr")
-            return ""
 
-        if append:
-            if self._passes and result.text.strip() == self._passes[-1].strip():
-                print("[merge] 识别内容与上一段相同（画面没变化），不重复追加")
-            else:
-                self._passes.append(result.text)
+        # 新题（按 Q）→ 新记录。放在识别之前：识别失败也算「开了新的一题」，
+        # 否则下一次成功的解答会覆盖掉上一题的记录
+        if not append:
+            self._entry_id = self.qa_log.next_id()
+        if mode == "image":
+            rec, why = self._recognize_image(frame, append)
         else:
-            self._passes = [result.text]
-            self._entry_id = self.qa_log.next_id()  # 新题 → 新记录
+            rec, why = self._recognize_ocr(frame, append)
+        if rec is None:
+            self._status(why, "capture" if mode == "image" else "ocr")
+            return ""
 
-        chars = sum(len(p) for p in self._passes)
-        print(f"[merge] 当前共 {len(self._passes)} 段识别结果，总字数 {chars}")
+        print(f"[merge] {rec.summary}")
         if self.cfg.answer_mode == "none":
+            if mode == "image":
+                # 图片模式本地没有任何题目文本可展示，「只识别不解答」在这条路上
+                # 没有意义。说清楚怎么办，而不是让浮层空着或永远停在「作答中」
+                self._status(
+                    f"answer_mode=none 在 image 模式下没有可展示的识别结果"
+                    f"（题目没有在本地被读过，{rec.summary}）。\n\n"
+                    f"想「只识别不解答」请把 config.yaml 的 input_mode 改成 ocr，"
+                    f"或按 {self._key('input_mode')} 切到本地 OCR。", "answer")
+                return ""
             # 只识别不解答：把识别到的原文投上去。否则浮层会永远停在
             # 「AI 作答中…」——它其实早就干完了，只是本来就不解答
-            self._status(f"（answer_mode=none，只识别不解答 / 共 {chars} 字）\n\n"
+            self._status(f"（answer_mode=none，只识别不解答 / {rec.summary}）\n\n"
                          + "\n\n".join(self._passes), "ocr")
         else:
-            self._status(f"AI 作答中…（已识别 {chars} 字）", "answer")
+            self._status(f"AI 作答中…（{rec.summary}）", "answer")
         # 流式：模型吐一块就往浮层刷一块，长代码题不用干等整段
         sink = self._stream_sink()
-        answer = self.answerer.answer_from_passes(self._passes, on_text=sink)
+        if mode == "image":
+            answer = self.answerer.answer_from_shots(self._shots, on_text=sink)
+        else:
+            answer = self.answerer.answer_from_passes(self._passes, on_text=sink)
         self._last_answer = answer
         self._deliver(answer, streamed=bool(sink and sink.delivered))
 
@@ -761,10 +930,10 @@ class App:
             with self._refine_lock:
                 self.qa_log.upsert(
                     self._entry_id,
-                    question="\n\n".join(self._passes),
+                    question=rec.question,
                     answer=answer,
-                    passes=len(self._passes),
-                    ocr_conf=result.confidence,
+                    passes=rec.count,
+                    ocr_conf=rec.conf,
                 )
                 gen = self._refine_gen.get(self._entry_id, 0) + 1
                 self._refine_gen[self._entry_id] = gen
@@ -774,16 +943,111 @@ class App:
             self._refine_gen[self._entry_id] = gen
 
         # 后台把原始记录丢给 AI 整理（去界面噪音/规范格式）后覆盖：
-        # 不阻塞解答流程；期间若按 A 更新了内容，旧整理作废不覆盖
-        self._spawn_refine(self._entry_id, gen,
-                           "\n\n".join(self._passes), answer)
+        # 不阻塞解答流程；期间若按 A 更新了内容，旧整理作废不覆盖。
+        # 图片模式下这一步还负责**把题面从截图里读出来**（本地没有文本），
+        # 所以要把这一轮的截图快照带过去 —— 追加时 self._shots 会被原地改
+        self._spawn_refine(self._entry_id, gen, rec.question, answer,
+                           shots=list(self._shots) if mode == "image" else None)
         return answer
 
-    def _spawn_refine(self, entry_id: int, gen: int, raw_q: str, raw_a: str):
-        """后台线程：AI 整理题目/答案 → 更新 history 记录。"""
+    # -------- 识别：两种输入模式，各自把屏幕变成「能提问的东西」 --------
+    def _recognize_image(self, frame, append: bool) -> tuple[Recognized | None, str]:
+        """默认路径：把这一帧编码成图片块，累积到 self._shots。
+
+        本地不读一个字 —— 题目由模型直接看图。失败只有「编不出图」一种，
+        比 OCR 那条路少了「识别为空」「模型没下完」这些坑。
+        """
+        shot = imaging.encode_frame(frame,
+                                    max_side=self.cfg.image_max_side,
+                                    fmt=self.cfg.image_format,
+                                    quality=self.cfg.image_quality)
+        if shot is None:
+            return None, ("截图编码失败：webp / png / jpeg 都编不出来。"
+                          "多半是 opencv 装得不完整，重装 opencv-python 试试。")
+        if append:
+            # 画面没变就别追加：同一张图发两遍纯属浪费 token，还会让模型
+            # 以为题目真的重复了两段
+            if self._shots and shot.fingerprint == self._shots[-1].fingerprint:
+                print("[merge] 画面与上一张截图相同（没滚动/没翻页），不重复追加")
+            else:
+                self._shots.append(shot)
+        else:
+            self._shots = [shot]
+            self._passes = []       # 换模式后的残留：绝不能和截图一起发出去
+        print(f"---- 截图 {shot.width}x{shot.height} {shot.media_type} "
+              f"{shot.kb:.0f}KB{'（已缩放）' if shot.scaled else ''} ----")
+        n = len(self._shots)
+        return Recognized(
+            summary=f"已采集 {imaging.describe(self._shots)}",
+            # 图片模式本地没有题面文本。存个能看懂的占位，真正的题面由
+            # 后台 refine_from_images 从截图里读出来后覆盖（见 _spawn_refine）
+            question=image_placeholder_question(n),
+            conf=None, count=n), ""
+
+    def _recognize_ocr(self, frame, append: bool) -> tuple[Recognized | None, str]:
+        """兼容路径：本地 PaddleOCR 把这一帧识别成文字，累积到 self._passes。"""
+        ocr = self._ensure_ocr()
+        if not ocr.loaded:
+            # 模型是懒加载的：真正的下载/初始化就发生在下面这次 recognize 里。
+            # 首次可能要拉 200MB，paddle 的进度条只进它自己的 stdout，
+            # 无控制台版看起来就是卡死 —— 所以先把话说在前头
+            if models_cached():
+                self._status("首次识别：正在加载 OCR 模型，约十几秒…", "ocr")
+            else:
+                self._status("首次运行：正在下载 OCR 模型（约 200MB）…\n\n"
+                             "存到 .paddle_cache/ 里，视网速要几分钟。"
+                             "下完这一次，以后启动就不用等了。", "ocr")
+        try:
+            result = ocr.recognize(frame)
+        except ImportError as e:
+            # 精简安装（注释掉 requirements 里的 paddle 两行）时切到 ocr 模式
+            # 会走到这里。别把它说成「模型没下完」，那会让人去查网络
+            return None, (f"本地 OCR 依赖没装：{e}\n\n"
+                          "pip install paddleocr paddlepaddle 之后再试，\n"
+                          f"或按 {self._key('input_mode')} 切回截图直发"
+                          "（image 模式，不需要任何本地模型）。")
+        except Exception as e:
+            return None, (f"OCR 失败：{type(e).__name__}: {e}\n\n"
+                          "首次运行时多半是模型没下完（网络问题），再按一次重试。\n"
+                          f"不想等本地模型就按 {self._key('input_mode')} 切回"
+                          "截图直发（image 模式，不需要下载任何东西）。")
+        print(f"---- OCR 识别结果 (conf={result.confidence:.2f} "
+              f"{result.elapsed_ms:.0f}ms) ----")
+        print(result.text[:1000])
+        if not result.text.strip():
+            # 最常见的原因就是截错屏（题目在另一块显示器上），所以直接把
+            # 换屏热键写在提示里，不用去翻文档
+            return None, (f"这一屏没识别到文字。题目可能在另一块显示器上"
+                          f"（{self._key('monitor')} 换屏），或者字太小/对比度太低。")
+
+        if append:
+            if self._passes and result.text.strip() == self._passes[-1].strip():
+                print("[merge] 识别内容与上一段相同（画面没变化），不重复追加")
+            else:
+                self._passes.append(result.text)
+        else:
+            self._passes = [result.text]
+            self._shots = []        # 换模式后的残留：绝不能和 OCR 文本一起发出去
+        chars = sum(len(p) for p in self._passes)
+        return Recognized(
+            summary=f"已识别 {len(self._passes)} 段 / 共 {chars} 字",
+            question="\n\n".join(self._passes),
+            conf=result.confidence, count=len(self._passes)), ""
+
+    def _spawn_refine(self, entry_id: int, gen: int, raw_q: str, raw_a: str,
+                      shots: list | None = None):
+        """后台线程：AI 整理题目/答案 → 更新 history 记录。
+
+        :param shots: 图片模式传本轮截图 —— 那条路上本地没有题面文本，
+                      得让模型顺手从截图里把题目读出来（否则复盘记录里
+                      只有答案、题目是个占位符，这条记录基本白存）
+        """
         def _task():
             try:
-                refined = self.answerer.refine_for_history(raw_q, raw_a)
+                if shots:
+                    refined = self.answerer.refine_from_images(shots, raw_a)
+                else:
+                    refined = self.answerer.refine_for_history(raw_q, raw_a)
                 if not refined:
                     return  # 保留原始记录
                 # 版本号检查与写库原子：期间记录被 A 更新过则作废
@@ -892,6 +1156,9 @@ class App:
              lambda: self._nudge(0, -self.NUDGE)),
             (19, "move_down", ("Ctrl+Alt+Shift+J",), "浮层下移",
              lambda: self._nudge(0, +self.NUDGE)),
+            # O 容易被 Office 系/截图工具占，回退到 Y / U
+            (20, "input_mode", ("Ctrl+Alt+Y", "Ctrl+Alt+U"), "切换输入模式（截图直发 ⇄ 本地 OCR）",
+             self._cycle_input_mode),
         ]
 
         mapping: dict[int, tuple[int, int, object]] = {}
@@ -1060,6 +1327,32 @@ class App:
             self.overlay.move(x, y, save=True)
             print(f"[monitor] 浮层已移到屏 {new} 右上角")
 
+    def _cycle_input_mode(self):
+        """热键 O：在「截图直发」和「本地 OCR」之间切换（image ⇄ ocr）。
+
+        为什么要能现场切：这一屏是公式/图表/带缩进的代码 → 图片模式看得清；
+        网络慢、上行掐得死、或者干脆断网了 → 切本地 OCR，出网只剩几 KB 文本。
+        改配置重启也能切，但笔试中途重启一次程序的代价太大了。
+
+        切换必须把两边的累积**都**清掉：留着上一模式的半道题，下一次追加
+        就会把 OCR 文本和截图凑到一起发出去 —— 那是明确不要的组合。
+        只在内存里生效，不落盘：重启回到 config.yaml 写的那个模式。
+        """
+        cur = self.cfg.input_mode
+        new = INPUT_MODES[(INPUT_MODES.index(cur) + 1) % len(INPUT_MODES)] \
+            if cur in INPUT_MODES else INPUT_MODES[0]
+        self.cfg.input_mode = new
+        dropped = f"（丢弃已累积的 {len(self._passes) or len(self._shots)} 段/张）" \
+            if (self._passes or self._shots) else ""
+        self._passes, self._shots = [], []
+        if new == "ocr":
+            self._ensure_ocr()
+        note = ""
+        if new == "ocr" and not models_cached():
+            note = "\n\n首次用本地 OCR 要先下约 200MB 模型（存 .paddle_cache/）。"
+        self._status(f"输入模式 → {self._mode_label(new)}{dropped}"
+                     f"\n\n按 {self._key('solve')} 重新识别这道题。{note}", "input")
+
     def _hotkey_loop(self, mapping):
         """消息循环（主线程）：接收并分发 WM_HOTKEY。"""
         import ctypes
@@ -1119,6 +1412,8 @@ class App:
             ("toggle", "显示/隐藏浮层"),
             ("clear", "清空浮层"),
             ("monitor", "切换截图显示器"),
+            ("input_mode", "切换输入模式：截图直发 ⇄ 本地 OCR（当前"
+                           + ("截图直发）" if self.cfg.input_mode == "image" else "本地 OCR）")),
             ("dock", "浮层停靠：右上→右下→左下→左上→居中"),
             ("font_up", "字号 +2"),
             ("font_down", "字号 -2"),
@@ -1162,7 +1457,7 @@ class App:
             sys.exit(0)
 
     def run_once_cli(self, duration: float | None = None):
-        """`--once`：截屏+OCR+解答一次。
+        """`--once`：截屏+识别+解答一次。
 
         浮层模式下不能跑完就返回 —— 窗口一销毁答案就没了，得停下来等人看完。
         以前这里是 `while True: sleep(1)`，只能 Ctrl+C，而且有两个隐患：
@@ -1191,9 +1486,12 @@ class App:
 
 def parse_args():
     p = argparse.ArgumentParser(description="面试辅助工具（Windows）")
-    p.add_argument("--once", action="store_true", help="只做一次 截屏+OCR+解答 后退出")
+    p.add_argument("--once", action="store_true", help="只做一次 截屏+解答 后退出")
     p.add_argument("--config", default="config.yaml", help="配置文件路径")
     p.add_argument("--delivery", choices=["overlay", "clipboard"], help="答案投递方式")
+    p.add_argument("--input-mode", choices=list(INPUT_MODES),
+                   help="题目怎么送给模型：image=截图直发（默认）、ocr=本地 PaddleOCR "
+                        "识别成文字（覆盖 config 的 input_mode；两者互斥）")
     p.add_argument("--answer-mode", choices=["api", "none"], help="解答模式（api=调用配置的模型）")
     p.add_argument("--monitor", type=int, choices=[0, 1, 2, 3, 4],
                    help="截图显示器编号：1=主屏 2=副屏… 0=全部合并（默认取 config）")
@@ -1244,20 +1542,30 @@ def cmd_refine(args) -> int:
     provider = AnswerProvider(mode="api", api_key=cfg.api_key,
                               api_url=cfg.api_url, model=cfg.api_model,
                               no_thinking=cfg.api_no_thinking)
-    ok = fail = 0
+    ok = fail = skip = 0
     for i, eid in enumerate(ids, 1):
         rec = qa.get(eid)
         if not rec:
             continue
+        question = rec.get("question", "")
+        if question.startswith(IMAGE_Q_PREFIX):
+            # image 模式的记录，题面本来该由后台整理从截图里读出来，但那一步
+            # 当时失败了。截图不落盘，现在只剩答案 —— 拿占位文本去整理只会
+            # 让模型凭答案编一道题出来，那比留着占位更糟
+            print(f"[refine] ({i}/{len(ids)}) 第 {eid} 题是 image 模式记录且题面缺失，"
+                  f"截图已不在，跳过")
+            skip += 1
+            continue
         print(f"[refine] ({i}/{len(ids)}) 整理第 {eid} 题 ...")
-        refined = provider.refine_for_history(rec.get("question", ""),
-                                              rec.get("answer", ""))
+        refined = provider.refine_for_history(question, rec.get("answer", ""))
         if refined:
             qa.refine(eid, refined[0], refined[1])
             ok += 1
         else:
             fail += 1
-    print(f"整理完成：成功 {ok}、失败 {fail}（失败记录保留原文）")
+    print(f"整理完成：成功 {ok}、失败 {fail}"
+          + (f"、跳过 {skip}" if skip else "")
+          + "（失败/跳过的记录保留原文）")
     out = qa.export_markdown()
     print(f"复盘文档已更新：{out}")
     return 0

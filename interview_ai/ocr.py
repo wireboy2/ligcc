@@ -8,16 +8,19 @@
 - 结果缓存 + 文本变化检测：画面未变时直接复用，避免重复推理浪费 CPU
 
 为何选 PaddleOCR 而非 EasyOCR / 云端 API：
-  - 本地离线 = 零出网流量，规避"网络层 AI API 调用"这一最易被检测的信号
+  - 本地离线 = 出网只有几 KB 文本，不会每按一次热键就推一个 MB 级图片请求
   - 中文 + 代码混合场景准确率高于 EasyOCR / Tesseract
-  - 如需更强语义（含公式/图表），可在 ocr_with_vlm.py 中接入本地多模态模型
+
+本模块只在 `input_mode: ocr` 时才会被用到。默认的 `input_mode: image`
+把截图直接连同提示词交给多模态模型（见 imaging.py 与 main.py 的分发），
+公式/图表/代码缩进这类 OCR 拍平后就丢掉的信息在那条路上是保住的。
+两条路互斥：绝不会把 OCR 文本和截图一起发。
 """
-import hashlib
 import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -248,11 +251,13 @@ class OCR:
 
     @staticmethod
     def _frame_hash(frame: np.ndarray) -> str:
-        """用低分辨率灰度图的 md5 作为画面指纹，检测是否发生实质变化。"""
-        import cv2
-        small = cv2.resize(frame, (160, 90))
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        return hashlib.md5(gray.tobytes()).hexdigest()
+        """用低分辨率灰度图的 md5 作为画面指纹，检测是否发生实质变化。
+
+        实现放在 imaging 里与图片模式共用：同一个「画面变了没有」的判断
+        分两处各写一遍，早晚会出现两边结论不一致的怪事。
+        """
+        from imaging import frame_fingerprint
+        return frame_fingerprint(frame)
 
 
 # 向后兼容别名

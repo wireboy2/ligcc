@@ -10,6 +10,8 @@
   · _call_api           —— payload 带 stream + 关深度思考；端点不认这个字段
                            就去掉重来；端点无视 stream 直接吐整个 JSON 也要能读
   · _answer_with_retry  —— 已流出半页时**不能**重试（会把用户正抄的内容推翻）
+  · image_content       —— 图片模式的请求形状：图在前提示词在后，且**不带**
+                           任何 OCR 文本（两种输入模式互斥）
   · App 接线            —— 增量投浮层时必须保住滚动位置
 
 全程不出网、不建窗口：喂假的字节行流 + 假时钟 + 假响应对象。
@@ -344,6 +346,79 @@ def t_retry():
           "【API 调用失败】" in out and "题目" in out)
 
 
+def _shot(tag: str = "AAA", media: str = "image/webp"):
+    """一张假截图（imaging.Shot 的最小可用实例，不碰 opencv）。"""
+    from imaging import Shot
+    return Shot(b64=tag, media_type=media, width=1568, height=882,
+                nbytes=120 * 1024, fingerprint=tag, scaled=True)
+
+
+def t_image_mode():
+    section("八、图片模式：图在前、提示词在后，且绝不夹带 OCR 文本")
+    prov = AnswerProvider(api_key="k", api_url="u", model="m")
+
+    one = prov.image_content([_shot("IMG1")])
+    eq("单图两块：图 + 提示词", [b["type"] for b in one], ["image", "text"])
+    eq("图片块是 base64 source", one[0]["source"]["type"], "base64")
+    eq("media_type 跟着编码格式走", one[0]["source"]["media_type"], "image/webp")
+    eq("图片数据就是编好的 base64", one[0]["source"]["data"], "IMG1")
+    check("提示词在最后一块（官方建议单图这么放效果最好）",
+          one[-1]["type"] == "text" and "答案" in one[-1]["text"])
+    check("单图提示词要求忽略界面元素（地址栏/行号/状态栏那些噪音）",
+          "行号" in one[-1]["text"] and "地址栏" in one[-1]["text"])
+
+    two = prov.image_content([_shot("IMG1"), _shot("IMG2")])
+    eq("多图：每张前面加一行【第 N 张】标签",
+       [b["type"] for b in two], ["text", "image", "text", "image", "text"])
+    eq("标签认得出第几张", two[0]["text"], "【第 1 张截图】")
+    check("多图提示词说明是同一道题的不同部分（否则会被当成两道题）",
+          "同一道题目" in two[-1]["text"])
+
+    # 互斥的机器化确认：整个请求里不能出现任何「识别/OCR 文本」的痕迹
+    texts = " ".join(b.get("text", "") for b in two if b["type"] == "text")
+    check("图片请求里没有 OCR 识别文本（两种输入模式互斥）",
+          "OCR" not in texts and "识别结果" not in texts)
+
+    # 真正发出去的 payload 形状：content 必须是 blocks 列表，不能被拼成字符串
+    sent = []
+
+    def fake_open(payload):
+        sent.append(payload)
+        return FakeResp(sse_done(delta("答案")))
+
+    prov._open = fake_open
+    eq("图片模式也能正常拿到答案", prov.answer_from_shots([_shot("IMG1")]), "答案")
+    content = sent[-1]["messages"][0]["content"]
+    check("content 是 content blocks 列表（不是拼成一坨字符串）",
+          isinstance(content, list))
+    eq("列表里正好一张图", sum(1 for b in content if b["type"] == "image"), 1)
+    check("图片模式同样关掉深度思考（答题要的是首字快）",
+          sent[-1].get("thinking") == {"type": "disabled"})
+
+    eq("一张图都没有 → 不发请求，返回空", prov.answer_from_shots([]), "")
+    eq("None 也不算一张图", prov.answer_from_shots([None]), "")
+    eq("没发请求（列表为空时压根不该出网）", len(sent), 1)
+
+    # 图片模式失败时没有识别文本可回显，至少要说清「采了几张、没送出去」
+    import main as main_mod
+    real_sleep = main_mod.time.sleep
+    main_mod.time.sleep = lambda *_: None
+    try:
+        prov._call_claude = lambda c, on_text=None: (_ for _ in ()).throw(
+            ConnectionResetError("代理 403"))
+        out = prov.answer_from_shots([_shot("IMG1"), _shot("IMG2")])
+    finally:
+        main_mod.time.sleep = real_sleep
+    check("失败说明里带上「采了几张截图」", "2 张截图" in out, out)
+    check("末尾是失败原因", "【API 调用失败】" in out, out)
+    check("失败说明里不会回显 base64（那是几十万字符）", "IMG1" not in out)
+
+    # 存档整理：图片模式本地没有题面，得让模型从截图里读出来
+    refine = prov.image_content([_shot("IMG1")])[:-1]
+    check("整理请求复用同一批图片块（末尾换成整理提示词）",
+          len(refine) == 1 and refine[0]["type"] == "image")
+
+
 class _FakeOverlay:
     def __init__(self):
         self.text, self.keep, self.shown = None, None, 0
@@ -356,7 +431,7 @@ class _FakeOverlay:
 
 
 def t_app_wiring():
-    section("八、App 接线：增量进浮层，收尾不把滚动位置归零")
+    section("九、App 接线：增量进浮层，收尾不把滚动位置归零")
     # 不建真 App（那会拉起 OCR、写 history）：这两个方法只用到 cfg 和 overlay
     ov = _FakeOverlay()
     me = SimpleNamespace(cfg=SimpleNamespace(delivery=DeliveryMode.OVERLAY), overlay=ov)
@@ -383,10 +458,10 @@ def t_app_wiring():
 
 def main():
     print("=" * 70)
-    print("流式作答（SSE）单测：解析 / 节流 / 中断保留 / 关深度思考")
+    print("流式作答（SSE）单测：解析 / 节流 / 中断保留 / 关深度思考 / 图片模式")
     print("=" * 70)
     for t in (t_parse, t_collect, t_interrupt, t_callback_safety, t_sink,
-              t_call_api, t_retry, t_app_wiring):
+              t_call_api, t_retry, t_image_mode, t_app_wiring):
         t()
     print()
     print("=" * 70)
