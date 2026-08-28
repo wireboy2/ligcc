@@ -141,6 +141,9 @@ python interview_ai/main.py
 `aiKey.txt` 支持三行：`apiKey=`、`url=`、`模型：`，端点用 Anthropic Messages 格式
 （官方或兼容代理均可）。也可以改用 `config.yaml` 的 `api:` 段，优先级更高。
 
+> **不想看到黑窗？** 用 `pythonw.exe` 替代 `python`（见「使用技巧」里的详细说明）。
+> 更彻底的做法是把 `build.spec` 的 `CONSOLE = True` 改成 `False` 重打一次。
+
 ## 输入模式：题目怎么送到模型面前
 
 两条路**互斥**，`config.yaml` 一行切换，运行中按 `Ctrl+Alt+O` 也能临时换
@@ -203,6 +206,16 @@ input_mode: image   # 默认。截图 + 提示词一次发给多模态模型
 > 写错（解析不了）会打印提示并退回默认值。
 
 ## 使用技巧
+
+**不要黑窗 / 在后台安静跑**
+默认 `python` 启动器会弹一个 CMD 窗口。两种让它消失的方法：
+
+| 场景 | 做法 |
+| --- | --- |
+| 不想装任何东西、临时跑 | `start "" pythonw.exe interview_ai/main.py`（第一个 `""` 是占位标题，省掉标题栏那行小字；`pythonw.exe` 是 Python 自带的窗口子系统启动器，不弹黑窗、stdout/stderr 直接丢掉）关闭时候使用热键Ctrl+Alt+X也可以退出| 
+| 永久生效 | 把 `build.spec` 顶部的 `CONSOLE = True` 改成 `False`，重打一次。产物是个无控制台 exe，双击就跑，热键照常。要回头调配置或看日志再换 `python` 版本即可。|
+
+> 用 `pythonw.exe` 时你看不着 paddle 进度、API 响应这些运行期日志，调不通时换回 `python`。
 
 **长题分几次识别、合并作答**
 按 `Q` 截上半部分 → 滚动页面露出剩余部分 → 按 `A` 追加 →
