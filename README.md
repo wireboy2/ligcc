@@ -212,7 +212,7 @@ input_mode: image   # 默认。截图 + 提示词一次发给多模态模型
 
 | 场景 | 做法 |
 | --- | --- |
-| 不想装任何东西、临时跑 | `start "" pythonw.exe interview_ai/main.py`（第一个 `""` 是占位标题，省掉标题栏那行小字；`pythonw.exe` 是 Python 自带的窗口子系统启动器，不弹黑窗、stdout/stderr 直接丢掉）关闭时候使用热键Ctrl+Alt+X也可以退出| 
+| 不想装任何东西、临时跑 | `start "" pythonw.exe interview_ai/main.py`（第一个 `""` 是占位标题，省掉标题栏那行小字；`pythonw.exe` 是 Python 自带的窗口子系统启动器，不弹黑窗、stdout/stderr 直接丢掉；关闭时用 `Ctrl+Alt+X` 热键退出）|
 | 永久生效 | 把 `build.spec` 顶部的 `CONSOLE = True` 改成 `False`，重打一次。产物是个无控制台 exe，双击就跑，热键照常。要回头调配置或看日志再换 `python` 版本即可。|
 
 > 用 `pythonw.exe` 时你看不着 paddle 进度、API 响应这些运行期日志，调不通时换回 `python`。
