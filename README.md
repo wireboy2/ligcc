@@ -144,6 +144,63 @@ python interview_ai/main.py
 > **不想看到黑窗？** 用 `pythonw.exe` 替代 `python`（见「使用技巧」里的详细说明）。
 > 更彻底的做法是把 `build.spec` 的 `CONSOLE = True` 改成 `False` 重打一次。
 
+## 切换模型 / 第三方 API
+
+工具默认走 **Anthropic Messages** 格式（官方 `/v1/messages` 或兼容代理），
+`aiKey.txt` 不改、`config.yaml` 不碰就能继续用。但 DeepSeek 官网、智谱 GLM、
+Moonshot Kimi 等只提供 OpenAI 的 `/v1/chat/completions`，需要显式切方言 +
+改 model。两种接入方式：
+
+### 方式 A：用中转站（Anthropic 兼容路由）
+
+这是改动最小的路 —— 中转站通常把多家模型都接到 `/v1/messages` 下：
+
+```
+apiKey=你的key
+url=https://中转站.example.com/v1/messages
+模型：deepseek-v4-flash-vision-exp
+```
+
+代码能自动识别 `/messages` 结尾的 url，按 Anthropic 格式发包，**一字不改**
+就能换模型。DeepSeek 官方中转站也可以这样接：
+
+```
+url=https://api.deepseek.com/anthropic/v1/messages
+模型：deepseek-chat   # 或 deepseek-coder / deepseek-v4-flash-vision-exp
+```
+
+### 方式 B：直连 OpenAI 兼容端点（GLM / Kimi / DeepSeek 官网 …）
+
+在 `config.yaml` 的 `api:` 段写三样：
+
+```yaml
+api:
+  key: sk-xxxx
+  url: https://open.bigmodel.cn/api/paas/v4   # 智谱
+  model: glm-4.6v
+  format: openai                                # 必须显式写
+  extra_body:
+    thinking: false                             # GLM 关深度思考的字段
+  # extra_body 的字段各家不同（见下），按端点实际接受的值填
+```
+
+常用端点 / 思考字段对照：
+
+| 端点 | url | 常用模型名 | 关深度思考的字段 |
+| --- | --- | --- | --- |
+| 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4.6v` | `thinking: false` |
+| Moonshot Kimi K3 | `https://api.moonshot.cn/v1` | `kimi-k3` | `reasoning_effort: "none"` |
+| DeepSeek 官网 | `https://api.deepseek.com/v1` | `deepseek-chat` | 无（本身无思考开关，默认不思考）|
+
+> **`extra_body` 为什么不做猜测？** 各家端点对「关思考」的字段名不一致
+> （Anthropic 用 `{"type":"disabled"}`、GLM 用 `thinking: false`、Kimi 用
+> `reasoning_effort: "none"`），代码里堆一张表容易过时，让配置写清楚更稳。
+> 如果端点不支持该字段会返回 400，运行时会自动去掉并重发一次 —— 所以填错
+> 最坏也只是首字慢一点、多请求一次，不会挂掉。
+
+`aiKey.txt` 仍只支持 `apiKey` / `url` / `模型` 三行（向后兼容），想切 OpenAI
+格式时把配置挪到 `config.yaml` 即可。
+
 ## 输入模式：题目怎么送到模型面前
 
 两条路**互斥**，`config.yaml` 一行切换，运行中按 `Ctrl+Alt+O` 也能临时换

@@ -156,9 +156,11 @@ def main():
 
     net_libs = {"requests", "httpx", "urllib3", "urllib", "websocket", "socket"}
     has_net_import = bool(toplevel_imports(trees["capture"]) & (net_libs - {"urllib"}))
-    # C17：imaging 只负责「把一帧编成能塞进请求的图片块」，出网是 main 的事。
-    #   编码模块一旦自己出网，「截图去了哪」就不再只有一处可查
+    # C17/C19：imaging / dialect 只负责「编请求 / 拼 payload」，不出网也不碰浮层。
+    # 两层一旦跨过边界，「哪一步出问题」就再也没法靠一行 import 排查出来。
     imaging_net = bool(toplevel_imports(trees["imaging"]) & net_libs)
+    dialect_outside_deps = toplevel_imports(trees["dialect"]) & {"overlay", "main"}
+    dialect_net = bool(toplevel_imports(trees["dialect"]) & net_libs)
 
     # C1：overlay 代码里不得真正调用 SetLayeredWindowAttributes。
     #   正确的"每像素 alpha"走 UpdateLayeredWindow，根本不需要该函数；
@@ -298,6 +300,8 @@ def main():
         ("C17 imaging 顶层 import 无网络库（出网只在 main）", not imaging_net),
         ("C18 两种输入模式互斥（切换清空对方累积，图片请求不带 OCR 文本）",
          mutually_exclusive),
+        ("C19 dialect 不 import overlay/main（分层：编请求层不出网不碰浮层）",
+         not dialect_outside_deps and not dialect_net),
     ]
     for name, ok in constraints:
         print(f"  {'✅' if ok else '❌'} {name}")

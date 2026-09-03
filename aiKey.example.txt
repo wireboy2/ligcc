@@ -10,4 +10,16 @@ url=https://你的接口地址/v1/messages
 #   url=     Anthropic Messages 格式的端点（官方或兼容代理均可）
 #   模型：    模型名，中文冒号和英文冒号都认
 #
-# 也可以改用 config.yaml 的 api: { key/url/model } 段，优先级高于本文件。
+# 也可以改用 config.yaml 的 api: { key/url/model/format/extra_body } 段，
+# 优先级高于本文件。想切到 OpenAI 格式的端点（DeepSeek 官网 / 智谱 GLM /
+# Moonshot Kimi 等）时，配置写到 config.yaml 的 api: 段，形如：
+#
+#   api:
+#     key: sk-xxxx
+#     url: https://open.bigmodel.cn/api/paas/v4
+#     model: glm-4.6v
+#     format: openai
+#     extra_body:
+#       thinking: false
+#
+# 详见 README.md 的「切换模型 / 第三方 API」一节。

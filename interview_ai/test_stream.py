@@ -30,6 +30,7 @@ if sys.platform == "win32":
                                       errors="replace")
 
 from config import DeliveryMode                                      # noqa: E402
+from dialect import ANTHROPIC, OPENAI                                # noqa: E402
 from main import (AnswerProvider, ApiError, App, StreamInterrupted,   # noqa: E402
                   StreamSink, collect_sse_answer, parse_sse_lines)
 
@@ -73,6 +74,26 @@ def sse_done(*events: dict) -> list[bytes]:
     happy path 必须带上；故意不带的用例直接用 sse()（见三之二）。
     """
     return sse(*events, {"type": "message_stop"})
+
+
+def sse_openai(*deltas: str, finish: bool = True) -> list[bytes]:
+    """OpenAI 风格的流式字节：choices[0].delta.content + finish_reason。"""
+    out = []
+    for d in deltas:
+        ev = {"id": "evt", "object": "chat.completion.chunk",
+              "created": 1, "model": "m",
+              "choices": [{"index": 0, "delta": {"content": d},
+                           "finish_reason": None}]}
+        out.append(("data: " + json.dumps(ev, ensure_ascii=False) + "\n").encode())
+        out.append(b"\n")
+    if finish:
+        stop = {"id": "evt", "object": "chat.completion.chunk",
+                "created": 1, "model": "m",
+                "choices": [{"index": 0, "delta": {},
+                             "finish_reason": "stop"}]}
+        out.append(("data: " + json.dumps(stop, ensure_ascii=False) + "\n").encode())
+        out.append(b"\n")
+    return out
 
 
 def delta(text=None, thinking=None) -> dict:
@@ -237,7 +258,7 @@ def t_call_api():
     section("六、_call_api：payload 带 stream + 关思考，读回流式正文")
     sent = []
 
-    def fake_open(payload):
+    def fake_open(payload, dialect=None):
         sent.append(dict(payload))
         return FakeResp(sse_done(delta("hi"), delta(" there")))
 
@@ -255,7 +276,7 @@ def t_call_api():
     # 端点不认 thinking 字段 → 去掉重来一次，并记住本次运行不再白试
     calls = []
 
-    def picky_open(payload):
+    def picky_open(payload, dialect=None):
         calls.append(dict(payload))
         if "thinking" in payload:
             raise ApiError(400, '{"error":{"message":"thinking: unsupported parameter"}}')
@@ -271,7 +292,7 @@ def t_call_api():
 
     # 与 thinking 无关的 400（模型名写错、余额不足）必须原样抛给重试逻辑
     prov4 = AnswerProvider(api_key="k", api_url="u", model="m")
-    prov4._open = lambda payload: (_ for _ in ()).throw(ApiError(400, "model not found"))
+    prov4._open = lambda payload, dialect=None: (_ for _ in ()).throw(ApiError(400, "model not found"))
     try:
         prov4._call_api("题目")
         check("无关的 400 原样抛出", False, "被吞了")
@@ -284,13 +305,13 @@ def t_call_api():
                                    {"type": "text", "text": "整段答案"}]},
                       ensure_ascii=False).encode()
     resp5 = FakeResp([body])
-    prov5._open = lambda payload: resp5
+    prov5._open = lambda payload, dialect=None: resp5
     eq("非 SSE 响应也能读出正文", prov5._call_api("题目"), "整段答案")
     check("响应对象被关掉（不漏 socket）", resp5.closed is True)
 
     # 空流当失败抛出，否则浮层会永远停在「AI 作答中…」
     prov6 = AnswerProvider(api_key="k", api_url="u", model="m")
-    prov6._open = lambda payload: FakeResp(sse({"type": "message_stop"}))
+    prov6._open = lambda payload, dialect=None: FakeResp(sse({"type": "message_stop"}))
     try:
         prov6._call_api("题目")
         check("一个 text 增量都没有 → 当失败抛出", False, "静悄悄返回了空")
@@ -301,7 +322,7 @@ def t_call_api():
     # 并且响应对象照样关掉 —— 异常路径最容易漏 socket
     prov7 = AnswerProvider(api_key="k", api_url="u", model="m")
     resp7 = FakeResp(sse(delta("半截")))
-    prov7._open = lambda payload: resp7
+    prov7._open = lambda payload, dialect=None: resp7
     try:
         prov7._call_api("题目")
         check("提前结束 → 抛 StreamInterrupted", False, "当成完整答案返回了")
@@ -319,7 +340,7 @@ def t_retry():
         tries.append(1)
         raise StreamInterrupted("已经写了一半", ConnectionResetError("掐线"))
 
-    prov._call_claude = half
+    prov._call_api = half
     out = prov._answer_with_retry("题目")
     check("保留了已经流出来的正文", out.startswith("已经写了一半"), out)
     check("末尾标一行「连接中断」", "连接中断，已保留 6 字" in out, out)
@@ -336,7 +357,7 @@ def t_retry():
             tries.append(1)
             raise ConnectionResetError("代理 403")
 
-        prov._call_claude = boom
+        prov._call_api = boom
         out = prov._answer_with_retry("题目")
     finally:
         main_mod.time.sleep = real_sleep
@@ -382,7 +403,7 @@ def t_image_mode():
     # 真正发出去的 payload 形状：content 必须是 blocks 列表，不能被拼成字符串
     sent = []
 
-    def fake_open(payload):
+    def fake_open(payload, dialect=None):
         sent.append(payload)
         return FakeResp(sse_done(delta("答案")))
 
@@ -404,7 +425,7 @@ def t_image_mode():
     real_sleep = main_mod.time.sleep
     main_mod.time.sleep = lambda *_: None
     try:
-        prov._call_claude = lambda c, on_text=None: (_ for _ in ()).throw(
+        prov._call_api = lambda c, on_text=None: (_ for _ in ()).throw(
             ConnectionResetError("代理 403"))
         out = prov.answer_from_shots([_shot("IMG1"), _shot("IMG2")])
     finally:
@@ -456,12 +477,68 @@ def t_app_wiring():
           App._stream_sink(clip) is None)
 
 
+def t_openai_dialect():
+    section("十、OpenAI 方言：流式解析 + 图片块转换 + 非流式兜底")
+    sent = []
+
+    def fake_open(payload, dialect=None):
+        sent.append(dict(payload))
+        return FakeResp(sse_openai("hi", " there", finish=True))
+
+    prov = AnswerProvider(api_key="k", api_url="https://api.example.com/v1", model="gpt-4o",
+                          dialect=OPENAI)
+    prov._open = fake_open
+    eq("openai 流式正文拼回来", prov._call_api("题目"), "hi there")
+    req = sent[-1]
+    check("payload 里 stream=True", req.get("stream") is True)
+    check("payload 里 messages 是 list", isinstance(req.get("messages"), list))
+    check("openai 格式不自动塞 thinking 字段（让调用方通过 extra_body 传）",
+          "thinking" not in req)
+    # 图片块：anthropic source → openai image_url
+    from imaging import Shot
+    shot = Shot(b64="dGVzdA==", media_type="image/webp", width=100, height=100,
+                nbytes=100, fingerprint="a", scaled=False)
+    req2 = prov._resolve_dialect().build_messages(
+        [{"type": "image", "source": {"type": "base64",
+                                      "media_type": "image/webp",
+                                      "data": "dGVzdA=="}},
+         {"type": "text", "text": "提示词"}],
+        "glm-4.6v", False, {})
+    # openai build_messages 把图片前缀的文本放 system，图片放 user
+    user_content = req2["messages"][-1]["content"]
+    eq("图片块转成 image_url", user_content[0]["type"], "image_url")
+    eq("data URI 包含 base64 数据",
+       user_content[0]["image_url"]["url"],
+       "data:image/webp;base64,dGVzdA==")
+    # 提示词进了 system 消息（OpenAI 格式下图片块前的文字被当作 system prompt）
+    sys_text = req2["messages"][0].get("content", "")
+    eq("提示词在 system 消息里", sys_text, "提示词")
+
+    # 非流式兜底（用 OpenAI 方言，对应「端点无视 stream」的真实场景）
+    prov3 = AnswerProvider(api_key="k", api_url="u", model="m", dialect=OPENAI)
+    body = json.dumps({"choices": [{"message": {"content": "整段答案"},
+                                   "finish_reason": "stop"}]}).encode()
+    resp3 = FakeResp([body])
+    prov3._open = lambda payload, dialect=None: resp3
+    eq("非 SSE 响应也能读出正文", prov3._call_api("题目"), "整段答案")
+    check("响应对象被关掉（不漏 socket）", resp3.closed is True)
+
+    # 空流当失败抛出
+    prov4 = AnswerProvider(api_key="k", api_url="u", model="m")
+    prov4._open = lambda payload, dialect=None: FakeResp(sse_openai(finish=True))
+    try:
+        prov4._call_api("题目")
+        check("一个 text 增量都没有 → 当失败抛出", False, "静悄悄返回了空")
+    except RuntimeError:
+        check("一个 text 增量都没有 → 当失败抛出（上层会重试）", True)
+
+
 def main():
     print("=" * 70)
     print("流式作答（SSE）单测：解析 / 节流 / 中断保留 / 关深度思考 / 图片模式")
     print("=" * 70)
     for t in (t_parse, t_collect, t_interrupt, t_callback_safety, t_sink,
-              t_call_api, t_retry, t_image_mode, t_app_wiring):
+              t_call_api, t_retry, t_image_mode, t_app_wiring, t_openai_dialect):
         t()
     print()
     print("=" * 70)

@@ -51,6 +51,13 @@ class Config:
     api_key: str = ""                # Claude API Key
     api_url: str = ""                # API 端点 URL
     api_model: str = ""              # 模型名称
+    # API 格式：auto（按 url 自动判断）/ anthropic（官方 Messages 格式，默认）
+    # / openai（OpenAI Chat Completions 格式，DeepSeek/GLM/Kimi 等需要显式指定）
+    api_format: str = "auto"
+    # 额外塞到请求体顶层的字段（thinking / reasoning_effort 等各家写法不同，
+    # 这里不做猜测，用户自己填。比如 GLM 关思考要 {"thinking": false}，
+    # Kimi K3 要 {"reasoning_effort": "none"}）
+    api_extra_body: dict = field(default_factory=dict)
     # 让模型别做深度思考：答题要的是「马上出字、边看边抄」，思考链再漂亮也
     # 是干等（实测首个正文字 21s → 6s）。False=不干预，模型爱想多久想多久
     api_no_thinking: bool = True
@@ -330,6 +337,12 @@ def load_config(path: str = "config.yaml") -> Config:
     cfg.api_key = api.get("key", cfg.api_key)
     cfg.api_url = api.get("url", cfg.api_url)
     cfg.api_model = api.get("model", cfg.api_model)
+    cfg.api_format = _choice(api.get("format", cfg.api_format),
+                             ("auto", "anthropic", "openai"),
+                             cfg.api_format, "api.format")
+    extra = api.get("extra_body")
+    if isinstance(extra, dict):
+        cfg.api_extra_body = extra
     cfg.api_no_thinking = bool(api.get("no_thinking", cfg.api_no_thinking))
     if not cfg.api_key:
         cfg = _load_api_from_keyfile(cfg, path)

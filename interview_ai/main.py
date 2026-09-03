@@ -74,7 +74,7 @@ import sys
 import time
 import threading
 from dataclasses import dataclass
-from typing import Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 # PaddleOCR 模型缓存重定向：
 # - 打包成 exe 后：放 exe 同目录 .paddle_cache（模型下载一次后复用）
@@ -105,6 +105,7 @@ from ocr import OCR, models_cached
 from overlay import (StealthOverlay, check_system, load_saved_monitor,
                      load_saved_pos, load_saved_size, load_state, save_monitor)
 from config import load_config, DeliveryMode, INPUT_MODES, Config as _CfgDefaults
+from dialect import resolve_dialect
 from history import QALog
 
 import json
@@ -174,32 +175,33 @@ def parse_sse_lines(lines: Iterable[bytes]) -> Iterator[dict]:
 
 
 def collect_sse_answer(lines: Iterable[bytes],
-                       on_text: Callable[[str], None] | None = None) -> tuple[str, int]:
-    """消费 Anthropic Messages 的 SSE 事件流 → (完整正文, thinking 字数)。
+                       on_text: Callable[[str], None] | None = None,
+                       dialect: Any = None) -> tuple[str, int]:
+    """消费模型 API 的 SSE 事件流 → (完整正文, thinking 字数)。
 
-    正文在 `content_block_delta` 的 `delta.text` 里；同一个事件也可能带
-    `delta.thinking`（深度思考的过程），那部分**不进答案**，只数字数用来
-    确认「关闭深度思考」这个开关到底有没有生效。
+    正文在 dialect.text_delta 里；thinking 在 dialect.thinking_delta 里。
+    收尾由 dialect.is_stop 判定。
 
-    收尾事件（`message_stop` / 带 stop_reason 的 `message_delta`）必须收到，
-    否则算断流：实测这个代理会在答到一半时静悄悄 EOF（没有异常、没有收尾
-    事件），那时 socket 读到的就是干净的流结束 —— 不检查的话，半句话会被
-    当成完整答案交出去，比报错更坏。
+    收尾事件必须收到，否则算断流：实测这个代理会在答到一半时静悄悄 EOF
+    （没有异常、没有收尾事件），那时 socket 读到的就是干净的流结束 ——
+    不检查的话，半句话会被当成完整答案交出去，比报错更坏。
 
     :param on_text: 每收到一块正文调一次，参数是**当前已累积的全文**
                     —— 浮层要的就是全文，节流交给回调方（见 StreamSink）。
                     回调自己抛异常不会带走答案：改成收完再显示。
+    :param dialect: 方言，见 dialect.resolve_dialect。None 时退回 Anthropic 默认。
     :raises StreamInterrupted: 中途断开/提前结束，且已收到正文
     """
+    if dialect is None:
+        from dialect import ANTHROPIC
+        dialect = ANTHROPIC
     parts: list[str] = []
     think_chars = 0
     done = False
     try:
         for ev in parse_sse_lines(lines):
-            kind = ev.get("type")
-            if kind == "content_block_delta":
-                delta = ev.get("delta") or {}
-                chunk = delta.get("text")
+            if dialect.text_delta is not None:
+                chunk = dialect.text_delta(ev)
                 if isinstance(chunk, str) and chunk:
                     parts.append(chunk)
                     if on_text:
@@ -209,20 +211,18 @@ def collect_sse_answer(lines: Iterable[bytes],
                             on_text = None
                             print(f"[stream] 增量投递失败，改为收完再显示: {e}")
                     continue
-                think = delta.get("thinking")
+            if dialect.thinking_delta is not None:
+                think = dialect.thinking_delta(ev)
                 if isinstance(think, str):
                     think_chars += len(think)
-            elif kind == "message_stop":
+            if dialect.is_stop is not None and dialect.is_stop(ev):
                 done = True
-            elif kind == "message_delta":
-                if (ev.get("delta") or {}).get("stop_reason"):
-                    done = True
-            elif kind == "error":
+            elif ev.get("type") == "error":
                 err = ev.get("error") if isinstance(ev.get("error"), dict) else {}
                 raise RuntimeError(f"服务端错误 {err.get('type', '?')}: "
                                    f"{err.get('message') or ev}")
         if not done and parts:
-            raise RuntimeError("流提前结束（没有收到 message_stop，答案是半截的）")
+            raise RuntimeError("流提前结束（没有收到收尾事件，答案是半截的）")
     except Exception as e:
         text = "".join(parts)
         if text.strip():
@@ -265,11 +265,14 @@ class StreamSink:
 
 
 # ---------------------------------------------------------------------------
-# 答案生成：调用 Claude API (兼容 Anthropic Messages 格式)
+# 答案生成：调用模型 API（Anthropic / OpenAI 方言）
 # ---------------------------------------------------------------------------
 class AnswerProvider:
     """
-    题目 → 答案文本。通过配置的 Claude API 接口完成解答。
+    题目 → 答案文本。通过配置的模型 API 接口完成解答。
+
+    支持 Anthropic Messages 格式（默认）和 OpenAI Chat Completions 格式
+    （DeepSeek / GLM / Kimi 等）。格式通过 `dialect` 参数传入，上层不感知差异。
 
     题目有两种送法，**互斥**（见 config.INPUT_MODES）：
       · answer_from_shots(...)  截图直接发（默认）—— 图片块 + 提示词
@@ -299,11 +302,15 @@ class AnswerProvider:
     )
 
     def __init__(self, mode: str = "api", api_key: str = "", api_url: str = "",
-                 model: str = "", no_thinking: bool = True):
+                 model: str = "", no_thinking: bool = True,
+                 dialect: Any = None, api_extra_body: dict | None = None):
         self.mode = mode
         self.api_key = api_key
         self.api_url = api_url
         self.model = model
+        # 方言：Anthropic / OpenAI。None 时由 _resolve_dialect 从 url 自动推断。
+        self._dialect_raw = dialect
+        self.api_extra_body = api_extra_body or {}
         # 关掉模型的深度思考（见 _call_api）。留成开关是因为「要不要思考」
         # 本质是取舍：面试场景要首字快，别的用法可能宁可等更好的推理
         self.no_thinking = no_thinking
@@ -312,6 +319,18 @@ class AnswerProvider:
         # 重试时的进度回调（App 会接到浮层上）。代理抖一下要等 2s+4s，
         # 这十几秒里不说话，用户只会以为程序死了
         self.status_cb: Callable[[str], None] | None = None
+
+    def _resolve_dialect(self) -> Any:
+        """懒解析方言：首次调用时从 url 自动判断，并缓存。"""
+        if self._dialect_raw is not None:
+            return self._dialect_raw
+        from dialect import resolve_dialect
+        self._dialect_raw = resolve_dialect(
+            api_format="auto",
+            api_url=self.api_url,
+            api_extra_body=self.api_extra_body,
+        )
+        return self._dialect_raw
 
     def _say(self, msg: str):
         if self.status_cb:
@@ -409,7 +428,7 @@ class AnswerProvider:
         last_err = None
         for attempt in range(3):
             try:
-                return self._call_claude(content, on_text)
+                return self._call_api(content, on_text=on_text)
             except StreamInterrupted as e:
                 # 已经流出来的半页答案比「从头再来」有用：用户正照着抄，
                 # 把浮层推回开头等于让他白抄一遍。所以不重试，保留 + 标一行
@@ -531,53 +550,29 @@ class AnswerProvider:
                     return q, a
         return None
 
-    def _call_claude(self, question: str | list,
-                     on_text: Callable[[str], None] | None = None) -> str:
-        """解答入口：一次调用 = 一道题。
-
-        str  → OCR 文本模式，在这里拼上解答提示词；
-        list → 图片模式，content blocks 由 image_content() 拼好（提示词已在里面），
-               原样送出。
-        """
-        if not isinstance(question, str):
-            return self._call_api(question, on_text=on_text)
-        content = f"{self.PROMPT_TEXT}\n\n题目：\n{question}"
-        return self._call_api(content, on_text=on_text)
-
-    # 空闲超时（秒）。urlopen 的 timeout 是**单次 socket 读**的超时，不是整轮
-    # 耗时 —— 这正好是流式要的语义：只要还在往下吐（ping、增量块都算）就不算
-    # 空闲。上一版不流式，服务端在算完之前一个字节都不发，一道长题（实测
-    # 133s）必然在 60s 处 socket.timeout，然后白白重试 3 次、共等 3 分钟，
-    # 最后浮层上写「API 调用失败」—— 答案其实一直好好地在路上。
-    IDLE_TIMEOUT = 180
-
     def _call_api(self, content: str | list, max_tokens: int = 4096,
                   on_text: Callable[[str], None] | None = None) -> str:
-        """流式调用 Claude Messages API。
+        """流式调用模型 API。
 
         :param content: 完整的 user 消息 —— str（纯文本）或 content blocks 列表
-                        （图片模式，见 image_content）。Messages API 两种都收。
+                        （图片模式）。
         :param on_text: 增量回调，见 collect_sse_answer。None 也照样走流式 ——
                         流式顺手解决了长答案在 60s 处超时那个坑（见
                         IDLE_TIMEOUT），后台整理历史记录同样受益。
         :return: 完整答案正文
         """
-        payload = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "stream": True,
-            "messages": [{"role": "user", "content": content}],
-        }
-        # 关掉深度思考。实测这个端点：不带这个字段时首个正文字要等 21s
-        # （前面全是 thinking 增量块），带上只要 6s。答题场景要的是「马上出
-        # 字、边看边抄」，不是更漂亮的推理链
-        if self.no_thinking and self._thinking_param:
-            payload["thinking"] = {"type": "disabled"}
+        dialect = self._resolve_dialect()
+        payload = dialect.build_messages(
+            content, self.model, self.no_thinking and self._thinking_param,
+            self.api_extra_body,
+        )
+        # 手动注入 max_tokens（收集器可能希望更大）
+        payload["max_tokens"] = max_tokens
 
         try:
-            resp = self._open(payload)
+            resp = self._open(payload, dialect)
         except ApiError as e:
-            # 换到不认这个字段的端点时别整个功能挂掉（第三方代理各有各的脾气）：
+            # 换到不认 thinking 字段的端点时别整个功能挂掉（第三方代理各有各的脾气）：
             # 去掉字段重来一次，并记下本次运行不再发它
             if ("thinking" in payload and e.code == 400
                     and "thinking" in e.detail.lower()):
@@ -585,7 +580,7 @@ class AnswerProvider:
                       f"本次运行改为不发；模型可能会深度思考，首字更慢")
                 self._thinking_param = False
                 payload.pop("thinking")
-                resp = self._open(payload)
+                resp = self._open(payload, dialect)
             else:
                 raise
 
@@ -594,9 +589,12 @@ class AnswerProvider:
             if first.lstrip()[:1] in (b"{", b"["):
                 # 端点无视了 stream:true，直接吐了整个 JSON 响应：按非流式读完
                 body = json.loads((first + resp.read()).decode("utf-8", "replace"))
+                parsed = dialect.try_parse(body)
+                if parsed:
+                    return parsed
                 return self._text_from_message(body)
             text, think_chars = collect_sse_answer(
-                itertools.chain([first], resp), on_text)
+                itertools.chain([first], resp), on_text, dialect=dialect)
         finally:
             resp.close()
 
@@ -608,18 +606,22 @@ class AnswerProvider:
             raise RuntimeError("服务端没有返回正文（流里没有 text 增量）")
         return text
 
-    def _open(self, payload: dict):
+    def _open(self, payload: dict, dialect: Any):
         """发请求，返回**还没读**的响应对象（流式要自己逐行读）。"""
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "anthropic-version": "2023-06-01",
+            **dialect.headers,
             "Accept": "text/event-stream",
             # 该代理屏蔽 Python 默认 UA，必须带常规浏览器 UA
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         }
+        # 拼完整 url：方言的 path 是相对路径（如 /v1/messages），
+        # 如果 api_url 已经包含完整路径，直接拼上即可
+        base_url = self.api_url.rstrip("/")
+        url = base_url + dialect.path
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(self.api_url, data=data, headers=headers,
+        req = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST")
         try:
             return urllib.request.urlopen(req, timeout=self.IDLE_TIMEOUT)
@@ -726,6 +728,9 @@ class App:
             api_url=self.cfg.api_url,
             model=self.cfg.api_model,
             no_thinking=self.cfg.api_no_thinking,
+            dialect=resolve_dialect(
+                self.cfg.api_format, self.cfg.api_url, self.cfg.api_extra_body),
+            api_extra_body=self.cfg.api_extra_body,
         )
         # 重试等待期间的提示也投到浮层（回调在浮层建好之后才可能被调用）
         self.answerer.status_cb = lambda m: self._status(m, "api")
