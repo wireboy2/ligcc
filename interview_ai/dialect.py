@@ -40,7 +40,9 @@ from imaging import Shot
 class Dialect:
     """一份「端点规格」：给 provider 用它的字段来拼请求、读响应。"""
     # HTTP
-    path: str                        # 例如 "/v1/messages" 或 "/v1/chat/completions"
+    endpoint: str                    # 端点后缀，url 不是完整端点时拼在 base 后：
+                                     #   ANTHROPIC "/v1/messages"、OPENAI "/chat/completions"
+                                     #   （GLM base .../api/paas/v4 + 后缀 即得正确端点）
     headers: dict                    # 除 Authorization 之外要带的固定头
     # 请求体（返回完整 payload dict，上层只管 set 头）
     build_messages: Callable[
@@ -121,7 +123,7 @@ def _anthropic_try_parse(body: dict) -> str | None:
 
 
 ANTHROPIC = Dialect(
-    path="/v1/messages",
+    endpoint="/v1/messages",
     headers={"anthropic-version": "2023-06-01"},
     pic_block=_anthropic_pic_block,
     build_messages=_anthropic_build_messages,
@@ -251,7 +253,7 @@ def _openai_try_parse(body: dict) -> str | None:
 
 
 OPENAI = Dialect(
-    path="/v1/chat/completions",
+    endpoint="/chat/completions",
     headers={},
     pic_block=_openai_pic_block,
     build_messages=_openai_build_messages,

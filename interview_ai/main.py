@@ -550,6 +550,13 @@ class AnswerProvider:
                     return q, a
         return None
 
+    # 空闲超时（秒）。urlopen 的 timeout 是**单次 socket 读**的超时，不是整轮
+    # 耗时 —— 这正好是流式要的语义：只要还在往下吐（ping、增量块都算）就不算
+    # 空闲。上一版不流式，服务端在算完之前一个字节都不发，一道长题（实测
+    # 133s）必然在 60s 处 socket.timeout，然后白白重试 3 次、共等 3 分钟，
+    # 最后浮层上写「API 调用失败」—— 答案其实一直好好地在路上。
+    IDLE_TIMEOUT = 180
+
     def _call_api(self, content: str | list, max_tokens: int = 4096,
                   on_text: Callable[[str], None] | None = None) -> str:
         """流式调用模型 API。
@@ -616,10 +623,15 @@ class AnswerProvider:
             # 该代理屏蔽 Python 默认 UA，必须带常规浏览器 UA
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         }
-        # 拼完整 url：方言的 path 是相对路径（如 /v1/messages），
-        # 如果 api_url 已经包含完整路径，直接拼上即可
+        # url 两种写法都认（README 的方式 A / 方式 B）：
+        #   完整端点（…/messages 或 …/chat/completions 结尾）→ 原样使用，
+        #     这是 aiKey.txt / 中转站的写法，直接拼会得到双重路径
+        #   base（https://open.bigmodel.cn/api/paas/v4 这类）→ 拼方言端点后缀
         base_url = self.api_url.rstrip("/")
-        url = base_url + dialect.path
+        if base_url.lower().endswith(("/messages", "/chat/completions")):
+            url = base_url
+        else:
+            url = base_url + dialect.endpoint
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST")
@@ -1546,7 +1558,11 @@ def cmd_refine(args) -> int:
 
     provider = AnswerProvider(mode="api", api_key=cfg.api_key,
                               api_url=cfg.api_url, model=cfg.api_model,
-                              no_thinking=cfg.api_no_thinking)
+                              no_thinking=cfg.api_no_thinking,
+                              dialect=resolve_dialect(
+                                  cfg.api_format, cfg.api_url,
+                                  cfg.api_extra_body),
+                              api_extra_body=cfg.api_extra_body)
     ok = fail = skip = 0
     for i, eid in enumerate(ids, 1):
         rec = qa.get(eid)
