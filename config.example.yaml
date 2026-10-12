@@ -56,6 +56,14 @@ answer_mode: api      # api=调用下面配置的模型；none=只识别不解�
 #   # 面试场景要的是快：实测首字 21s → 6s，答案质量对这类题目没有可感差别。
 #   # 想看模型的推理过程、或者端点不认这个字段（会自动去掉重试一次）就设成 false
 #   no_thinking: true
+#   # 编程/算法题自动开深度思考（默认 true）：判成编程题的请求忽略 no_thinking，
+#   # 改为显式开启思考（Anthropic 格式发 thinking enabled，预算 8192 tokens）。
+#   # OCR 模式按题面关键词识别（零开销）；image 模式本地没有题面，先发一次
+#   # 轻量请求判断题型（每题多 1~3 秒，max_tokens 只有 16）。
+#   # 同时每次解答的提示词都带编程题作答要求：解法必须含 Java 版本（Main 类 +
+#   # main 方法），多输入输出必须用 java.util.Scanner 传统 IO（禁快速读写）。
+#   # OpenAI 格式端点的思考开关各家写法不同，仍由 extra_body 控制，此项不生效
+#   coding_thinking: true
 
 # ---------- 答案投递方式 ----------
 delivery: overlay     # overlay=隐形浮层（默认）；clipboard=写剪贴板

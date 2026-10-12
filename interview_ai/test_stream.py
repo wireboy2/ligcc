@@ -9,6 +9,8 @@
   · StreamSink          —— 上千个增量块必须节流，否则重绘把 CPU 烧光
   · _call_api           —— payload 带 stream + 关深度思考；端点不认这个字段
                            就去掉重来；端点无视 stream 直接吐整个 JSON 也要能读
+  · 编程/算法题         —— OCR 关键词开思考、image 先判题型再思考、
+                           Java/Scanner 作答要求进提示词
   · _answer_with_retry  —— 已流出半页时**不能**重试（会把用户正抄的内容推翻）
   · image_content       —— 图片模式的请求形状：图在前提示词在后，且**不带**
                            任何 OCR 文本（两种输入模式互斥）
@@ -30,9 +32,10 @@ if sys.platform == "win32":
                                       errors="replace")
 
 from config import DeliveryMode                                      # noqa: E402
-from dialect import ANTHROPIC, OPENAI                                # noqa: E402
+from dialect import ANTHROPIC, OPENAI, THINKING_BUDGET               # noqa: E402
 from main import (AnswerProvider, ApiError, App, StreamInterrupted,   # noqa: E402
-                  StreamSink, collect_sse_answer, parse_sse_lines)
+                  StreamSink, collect_sse_answer, looks_like_coding,
+                  parse_sse_lines)
 
 _fails: list[str] = []
 
@@ -122,6 +125,16 @@ class FakeResp:
 
     def close(self):
         self.closed = True
+
+
+def _fake_open_factory(sink: list, lines_for):
+    """造一个记录 payload 的假 _open：第 n 次调用用 lines_for(n) 给字节行。"""
+
+    def fake_open(payload, dialect=None, timeout=None):
+        sink.append(dict(payload))
+        return FakeResp(lines_for(len(sink)))
+
+    return fake_open
 
 
 def t_parse():
@@ -258,7 +271,7 @@ def t_call_api():
     section("六、_call_api：payload 带 stream + 关思考，读回流式正文")
     sent = []
 
-    def fake_open(payload, dialect=None):
+    def fake_open(payload, dialect=None, timeout=None):
         sent.append(dict(payload))
         return FakeResp(sse_done(delta("hi"), delta(" there")))
 
@@ -276,7 +289,7 @@ def t_call_api():
     # 端点不认 thinking 字段 → 去掉重来一次，并记住本次运行不再白试
     calls = []
 
-    def picky_open(payload, dialect=None):
+    def picky_open(payload, dialect=None, timeout=None):
         calls.append(dict(payload))
         if "thinking" in payload:
             raise ApiError(400, '{"error":{"message":"thinking: unsupported parameter"}}')
@@ -292,7 +305,8 @@ def t_call_api():
 
     # 与 thinking 无关的 400（模型名写错、余额不足）必须原样抛给重试逻辑
     prov4 = AnswerProvider(api_key="k", api_url="u", model="m")
-    prov4._open = lambda payload, dialect=None: (_ for _ in ()).throw(ApiError(400, "model not found"))
+    prov4._open = lambda payload, dialect=None, timeout=None: (
+        (_ for _ in ()).throw(ApiError(400, "model not found")))
     try:
         prov4._call_api("题目")
         check("无关的 400 原样抛出", False, "被吞了")
@@ -305,13 +319,14 @@ def t_call_api():
                                    {"type": "text", "text": "整段答案"}]},
                       ensure_ascii=False).encode()
     resp5 = FakeResp([body])
-    prov5._open = lambda payload, dialect=None: resp5
+    prov5._open = lambda payload, dialect=None, timeout=None: resp5
     eq("非 SSE 响应也能读出正文", prov5._call_api("题目"), "整段答案")
     check("响应对象被关掉（不漏 socket）", resp5.closed is True)
 
     # 空流当失败抛出，否则浮层会永远停在「AI 作答中…」
     prov6 = AnswerProvider(api_key="k", api_url="u", model="m")
-    prov6._open = lambda payload, dialect=None: FakeResp(sse({"type": "message_stop"}))
+    prov6._open = lambda payload, dialect=None, timeout=None: FakeResp(
+        sse({"type": "message_stop"}))
     try:
         prov6._call_api("题目")
         check("一个 text 增量都没有 → 当失败抛出", False, "静悄悄返回了空")
@@ -322,7 +337,7 @@ def t_call_api():
     # 并且响应对象照样关掉 —— 异常路径最容易漏 socket
     prov7 = AnswerProvider(api_key="k", api_url="u", model="m")
     resp7 = FakeResp(sse(delta("半截")))
-    prov7._open = lambda payload, dialect=None: resp7
+    prov7._open = lambda payload, dialect=None, timeout=None: resp7
     try:
         prov7._call_api("题目")
         check("提前结束 → 抛 StreamInterrupted", False, "当成完整答案返回了")
@@ -336,7 +351,7 @@ def t_retry():
     prov = AnswerProvider(api_key="k", api_url="u", model="m")
     tries = []
 
-    def half(question, on_text=None):
+    def half(question, on_text=None, thinking=None, timeout=None):
         tries.append(1)
         raise StreamInterrupted("已经写了一半", ConnectionResetError("掐线"))
 
@@ -353,7 +368,7 @@ def t_retry():
     try:
         tries.clear()
 
-        def boom(question, on_text=None):
+        def boom(question, on_text=None, thinking=None, timeout=None):
             tries.append(1)
             raise ConnectionResetError("代理 403")
 
@@ -376,7 +391,9 @@ def _shot(tag: str = "AAA", media: str = "image/webp"):
 
 def t_image_mode():
     section("八、图片模式：图在前、提示词在后，且绝不夹带 OCR 文本")
-    prov = AnswerProvider(api_key="k", api_url="u", model="m")
+    # coding_thinking=False：题型判断单独在第十一节测，这里只看请求形状
+    prov = AnswerProvider(api_key="k", api_url="u", model="m",
+                          coding_thinking=False)
 
     one = prov.image_content([_shot("IMG1")])
     eq("单图两块：图 + 提示词", [b["type"] for b in one], ["image", "text"])
@@ -403,7 +420,7 @@ def t_image_mode():
     # 真正发出去的 payload 形状：content 必须是 blocks 列表，不能被拼成字符串
     sent = []
 
-    def fake_open(payload, dialect=None):
+    def fake_open(payload, dialect=None, timeout=None):
         sent.append(payload)
         return FakeResp(sse_done(delta("答案")))
 
@@ -425,8 +442,8 @@ def t_image_mode():
     real_sleep = main_mod.time.sleep
     main_mod.time.sleep = lambda *_: None
     try:
-        prov._call_api = lambda c, on_text=None: (_ for _ in ()).throw(
-            ConnectionResetError("代理 403"))
+        prov._call_api = lambda c, on_text=None, thinking=None, timeout=None: (
+            (_ for _ in ()).throw(ConnectionResetError("代理 403")))
         out = prov.answer_from_shots([_shot("IMG1"), _shot("IMG2")])
     finally:
         main_mod.time.sleep = real_sleep
@@ -481,7 +498,7 @@ def t_openai_dialect():
     section("十、OpenAI 方言：流式解析 + 图片块转换 + 非流式兜底")
     sent = []
 
-    def fake_open(payload, dialect=None):
+    def fake_open(payload, dialect=None, timeout=None):
         sent.append(dict(payload))
         return FakeResp(sse_openai("hi", " there", finish=True))
 
@@ -503,7 +520,7 @@ def t_openai_dialect():
                                       "media_type": "image/webp",
                                       "data": "dGVzdA=="}},
          {"type": "text", "text": "提示词"}],
-        "glm-4.6v", False, {})
+        "glm-4.6v", "off", {})
     # openai build_messages 把图片前缀的文本放 system，图片放 user
     user_content = req2["messages"][-1]["content"]
     eq("图片块转成 image_url", user_content[0]["type"], "image_url")
@@ -519,13 +536,14 @@ def t_openai_dialect():
     body = json.dumps({"choices": [{"message": {"content": "整段答案"},
                                    "finish_reason": "stop"}]}).encode()
     resp3 = FakeResp([body])
-    prov3._open = lambda payload, dialect=None: resp3
+    prov3._open = lambda payload, dialect=None, timeout=None: resp3
     eq("非 SSE 响应也能读出正文", prov3._call_api("题目"), "整段答案")
     check("响应对象被关掉（不漏 socket）", resp3.closed is True)
 
     # 空流当失败抛出
     prov4 = AnswerProvider(api_key="k", api_url="u", model="m")
-    prov4._open = lambda payload, dialect=None: FakeResp(sse_openai(finish=True))
+    prov4._open = lambda payload, dialect=None, timeout=None: FakeResp(
+        sse_openai(finish=True))
     try:
         prov4._call_api("题目")
         check("一个 text 增量都没有 → 当失败抛出", False, "静悄悄返回了空")
@@ -533,12 +551,151 @@ def t_openai_dialect():
         check("一个 text 增量都没有 → 当失败抛出（上层会重试）", True)
 
 
+def t_coding_thinking():
+    section("十一、编程/算法题：OCR 关键词开思考、image 先判题型、Java/Scanner 要求")
+
+    # ---- looks_like_coding：强信号一个就够，弱信号要凑两个 ----
+    check("LeetCode 页面（强信号）",
+          looks_like_coding("c9.回文数-力扣(LeetCode) 给你一个整数 x"))
+    check("OJ 输入/输出描述（强信号）",
+          looks_like_coding("输入描述：第一行三个整数 a,b,s\n输出描述：输出最少花费"))
+    check("OJ 时间/内存限制（强信号）",
+          looks_like_coding("时间限制：C/C++语言 1000MS 内存限制：524288KB"))
+    check("「请实现」（强信号）",
+          looks_like_coding("请实现核心方法 topK，返回出现频率最高的 k 个元素"))
+    check("数组 + 示例（两个弱信号）",
+          looks_like_coding("给定一个整数数组 nums 和一个整数目标值 target。"
+                            "示例 1：输入 nums = [2,7,11,15]"))
+    check("单个弱信号不算（概念单选题）",
+          not looks_like_coding("在 ArrayList 的中间位置插入一个元素，"
+                                "平均时间复杂度是？"))
+    check("普通阅读理解不算",
+          not looks_like_coding("过度工作和压力都会不可避免地导致失眠症。"
+                                "森达公司的所有管理人员都有压力。"))
+    check("空文本不算", not looks_like_coding(""))
+
+    # ---- OCR 路径：判成编程题 → thinking enabled + max_tokens 抬到预算之上 ----
+    sent = []
+    prov = AnswerProvider(api_key="k", api_url="u", model="m")
+    prov._open = _fake_open_factory(
+        sent, lambda n: sse_done(delta("思路…"), delta("Java 代码…")))
+    out = prov.answer_from_passes(
+        ["1. 两数之和 给定一个整数数组 nums 和一个整数目标值 target。"
+         "示例 1：输入 nums = [2,7,11,15]，输出 [0,1]。"])
+    eq("答案正常返回", out, "思路…Java 代码…")
+    body = sent[-1]
+    eq("编程题 → 请求显式开启思考",
+       body.get("thinking"), {"type": "enabled", "budget_tokens": THINKING_BUDGET})
+    check("max_tokens 抬到思考预算之上（Anthropic 的硬性要求）",
+          body.get("max_tokens", 0) >= THINKING_BUDGET + 4096,
+          f"max_tokens={body.get('max_tokens')}")
+    user_text = body["messages"][0]["content"]
+    check("OCR 题面后追加了作答要求", isinstance(user_text, str))
+    check("要求里指明 Java 版本 + Main 类",
+          "Java 版本" in user_text and "public class Main" in user_text)
+    check("多输入输出要求用 Scanner 传统 IO、禁快速读写",
+          "java.util.Scanner" in user_text
+          and "BufferedReader" in user_text and "StreamTokenizer" in user_text)
+    check("要求是条件式的（非编程题可忽略）", "如果不是编程题" in user_text)
+
+    # ---- OCR 路径：非编程题 → 思考模式跟随 no_thinking 配置，但要求仍带上 ----
+    sent.clear()
+    prov.answer_from_passes(
+        ["过度工作和压力都会不可避免地导致失眠症。请根据材料判断以下结论的正误。"])
+    eq("非编程题保持原有关思考的默认行为",
+       sent[-1].get("thinking"), {"type": "disabled"})
+    check("非编程题的请求里也带条件式作答要求",
+          "java.util.Scanner" in sent[-1]["messages"][0]["content"])
+
+    # ---- 端点不认 thinking 字段 → 编程题也退回 default，不炸 ----
+    prov2 = AnswerProvider(api_key="k", api_url="u", model="m")
+    calls = []
+    prov2._open = _fake_open_factory(calls, lambda n: sse_done(delta("答案")))
+    prov2._open_original = prov2._open
+
+    def picky(payload, dialect=None, timeout=None):
+        if "thinking" in payload:
+            raise ApiError(400, "thinking: unsupported parameter")
+        return prov2._open_original(payload, dialect, timeout)
+
+    prov2._open = picky
+    prov2.answer_from_passes(["给定一个整数数组 nums，请实现两数之和。"])
+    check("编程题撞上不认 thinking 的端点 → 去掉字段照常出答案",
+          "thinking" not in calls[-1])
+
+    # ---- image 路径：先发一次小请求判题型，判成编程题才开思考 ----
+    calls.clear()
+
+    def lines_for(n):
+        return sse_done(delta("是")) if n == 1 else sse_done(delta("答案"))
+
+    prov3 = AnswerProvider(api_key="k", api_url="u", model="m")
+    prov3._open = _fake_open_factory(calls, lines_for)
+    eq("判成编程题 → 照常拿到答案", prov3.answer_from_shots([_shot("IMG1")]), "答案")
+    eq("共两次请求（先判题型后解答）", len(calls), 2)
+    eq("解答请求开了思考",
+       calls[-1].get("thinking"), {"type": "enabled", "budget_tokens": THINKING_BUDGET})
+    eq("判断请求自己不思考", calls[0].get("thinking"), {"type": "disabled"})
+    eq("判断请求 max_tokens 掐到 16", calls[0].get("max_tokens"), 16)
+    classify_text = " ".join(b.get("text", "") for b in
+                             calls[0]["messages"][0]["content"] if b["type"] == "text")
+    check("判断请求带的是题型判断提示词（不是解答提示词）",
+          "严格只回答一个字" in classify_text and "java.util.Scanner" not in classify_text)
+
+    # 判成非编程题 → 解答请求关思考（no_thinking 默认行为不变）
+    calls.clear()
+
+    def lines_for_no(n):
+        return sse_done(delta("否")) if n == 1 else sse_done(delta("答案"))
+
+    prov4 = AnswerProvider(api_key="k", api_url="u", model="m")
+    prov4._open = _fake_open_factory(calls, lines_for_no)
+    prov4.answer_from_shots([_shot("IMG1")])
+    eq("非编程题 → 解答请求关思考", calls[-1].get("thinking"), {"type": "disabled"})
+    check("image 解答提示词里同样带 Java/Scanner 要求",
+          any("java.util.Scanner" in b.get("text", "")
+              for b in calls[-1]["messages"][0]["content"] if b["type"] == "text"))
+
+    # 判断挂了 → 当非编程题，解答照常（辅助步骤不能变成故障）
+    calls.clear()
+
+    def flaky(payload, dialect=None, timeout=None):
+        calls.append(dict(payload))
+        if len(calls) == 1:
+            raise ConnectionResetError("判断请求挂了")
+        return FakeResp(sse_done(delta("答案")))
+
+    prov5 = AnswerProvider(api_key="k", api_url="u", model="m")
+    prov5._open = flaky
+    eq("判断失败不影响解答", prov5.answer_from_shots([_shot("IMG1")]), "答案")
+    eq("解答请求保持关思考", calls[-1].get("thinking"), {"type": "disabled"})
+
+    # coding_thinking=False → image 模式直接解答，不判断题型
+    calls.clear()
+    prov6 = AnswerProvider(api_key="k", api_url="u", model="m",
+                           coding_thinking=False)
+    prov6._open = _fake_open_factory(calls, lambda n: sse_done(delta("答案")))
+    prov6.answer_from_shots([_shot("IMG1")])
+    eq("开关关掉 → 只发一次解答请求", len(calls), 1)
+
+    # ---- Anthropic 方言 thinking 三态 ----
+    eq("off → disabled", ANTHROPIC.build_messages("x", "m", "off", {})["thinking"],
+       {"type": "disabled"})
+    eq("on → enabled + 预算",
+       ANTHROPIC.build_messages("x", "m", "on", {})["thinking"],
+       {"type": "enabled", "budget_tokens": THINKING_BUDGET})
+    check("default → 不发字段", "thinking" not in ANTHROPIC.build_messages("x", "m", "default", {}))
+    check("OpenAI 方言不自动塞思考字段（由 extra_body 控制）",
+          "thinking" not in OPENAI.build_messages("x", "m", "on", {}))
+
+
 def main():
     print("=" * 70)
-    print("流式作答（SSE）单测：解析 / 节流 / 中断保留 / 关深度思考 / 图片模式")
+    print("流式作答（SSE）单测：解析 / 节流 / 中断保留 / 关深度思考 / 图片模式 / 编程题思考")
     print("=" * 70)
     for t in (t_parse, t_collect, t_interrupt, t_callback_safety, t_sink,
-              t_call_api, t_retry, t_image_mode, t_app_wiring, t_openai_dialect):
+              t_call_api, t_retry, t_image_mode, t_app_wiring, t_openai_dialect,
+              t_coding_thinking):
         t()
     print()
     print("=" * 70)

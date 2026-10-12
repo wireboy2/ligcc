@@ -70,6 +70,7 @@ API 配置
 import argparse
 import itertools
 import os
+import re
 import sys
 import time
 import threading
@@ -265,6 +266,56 @@ class StreamSink:
 
 
 # ---------------------------------------------------------------------------
+# 编程/算法题识别（OCR 文本模式用：本地有题面，靠关键词判断要不要开深度思考）
+# ---------------------------------------------------------------------------
+# 强信号：命中一个就当编程题 —— OJ 页面特征（力扣/牛客/输入输出描述/时间内存
+# 限制）和「请实现…」这类明确要写代码的措辞，选择题里几乎不会出现
+_CODE_STRONG_RE = re.compile(
+    r"力扣|[Ll]eet[Cc]ode|牛客|nowcoder|acwing|洛谷"
+    r"|输入描述|输出描述|输入样例|输出样例"
+    r"|时间限制|内存限制"
+    r"|请(?:你)?(?:实现|编写)|编写一个(?:函数|程序|方法)"
+    r"|实现一个(?:函数|方法|类)|写一个函数|核心方法|函数签名|ACM ?模式")
+# 弱信号：数据结构/复杂度/OJ 版式这些词，选择题、概念题里也会蹦出一两个，
+# 所以单独一个不作数，至少凑够两个不同的才算
+_CODE_HINT_RE = re.compile(
+    r"数组|字符串|链表|二叉树|哈希|动态规划|贪心|回溯|双指针|滑动窗口|前缀和"
+    r"|单调栈|并查集|递归|时间复杂度|空间复杂度|O\([^)]*\)"
+    r"|示例|进阶|数据范围|\bnums\b|dp\["
+    r"|编程题|算法题|代码题")
+
+
+def looks_like_coding(text: str) -> bool:
+    """OCR 题面 → 是不是编程/算法题（决定要不要为这次解答开深度思考）。
+
+    识别不出来宁可当不是：顶多这道题没开思考（回到原来的快而浅），
+    不会把阅读理解题拖进思考里白等。误报的代价（选择题多想一会儿）
+    也远小于漏报（编程题答得浅）——所以强信号放得很宽，弱信号才收紧。
+    """
+    if not text:
+        return False
+    if _CODE_STRONG_RE.search(text):
+        return True
+    return len(set(_CODE_HINT_RE.findall(text))) >= 2
+
+
+# 编程/算法题的作答要求（追加到每次解答的提示词里，两种输入模式都带）。
+# 写成「是编程题才遵守」的条件式：image 模式本地判断不了题型，OCR 模式的
+# 关键词也可能漏 —— 让模型自己对着题面判断，选择题/概念题直接忽略这段
+CODING_RULES = (
+    "如果本题是编程/算法/代码题，还必须遵守：\n"
+    "1. 先给出核心解题思路（算法选择、关键步骤、时间与空间复杂度）；\n"
+    "2. 解法必须包含 Java 版本的完整可运行代码（public class Main 且含 main "
+    "方法，可直接提交 OJ），如有必要可再附其他语言版本；\n"
+    "3. 若题目需要处理多组/多行输入输出（ACM/OJ 从 stdin 读入），Java 代码必须"
+    "用 java.util.Scanner 传统输入输出（scanner.next() / nextInt() / hasNext() "
+    "等），输出用 System.out.println；不要用 BufferedReader、StreamTokenizer、"
+    "BufferedWriter、PrintWriter 等快速读写。\n"
+    "如果不是编程题（选择题、概念题、阅读理解等），忽略上面三条，直接作答。"
+)
+
+
+# ---------------------------------------------------------------------------
 # 答案生成：调用模型 API（Anthropic / OpenAI 方言）
 # ---------------------------------------------------------------------------
 class AnswerProvider:
@@ -284,13 +335,14 @@ class AnswerProvider:
     # 解答提示词。图片版必须明写「忽略界面元素」：截图里除了题目还有地址栏、
     # 导航、行号、状态栏、系统时间、通过率 —— OCR 模式下这些噪音是靠
     # refine 的清单事后清理的，图片模式直接在提问时就划清范围。
+    # 末尾统一追加编程题作答要求（Java 版本 + Scanner 传统 IO，见 CODING_RULES）
     PROMPT_TEXT = ("你是一个面试/编程题解答助手。请直接给出简洁准确的答案，"
                    "如果是代码题请给出完整可运行的代码。")
     PROMPT_IMAGE = (
         "你是一个面试/编程题解答助手。上面是屏幕截图，题目就在图里。\n"
         "请忽略与题目无关的界面元素：窗口标题、地址栏、导航栏与标签、登录/会员提示、"
         "通过率/在线人数等网站统计、编辑器行号、状态栏（如「行7，列3」）、系统时间。\n"
-        "直接给出简洁准确的答案；如果是代码题请给出完整可运行的代码。"
+        "直接给出简洁准确的答案。\n" + CODING_RULES
     )
     PROMPT_IMAGE_MULTI = (
         "你是一个面试/编程题解答助手。上面几张截图是【同一道题目】的不同部分"
@@ -298,11 +350,25 @@ class AnswerProvider:
         "请先把它们合并还原成一道完整的题目（在心中去重对齐，不要输出合并过程），"
         "并忽略与题目无关的界面元素：窗口标题、地址栏、导航栏与标签、登录/会员提示、"
         "通过率/在线人数等网站统计、编辑器行号、状态栏（如「行7，列3」）、系统时间。\n"
-        "然后直接给出简洁准确的答案；如果是代码题请给出完整可运行的代码。"
+        "然后直接给出简洁准确的答案。\n" + CODING_RULES
     )
+    # image 模式的题型判断提示词：本地读不到题面，先花一次小请求问模型
+    # 「这是不是编程题」，是的话解答请求才开深度思考。要求只答一个字，
+    # max_tokens 也只有 16 —— 这一步要的是快，不是长篇大论
+    CLASSIFY_PROMPT = (
+        "上面截图里是一道面试题。请判断它是否为「编程/算法/代码题」："
+        "需要编写完整程序或函数作答的题（LeetCode、牛客/OJ、ACM 笔试题、"
+        "代码填空/补全），或需要逐步分析代码才能得出答案的题。\n"
+        "忽略窗口标题、导航栏等界面元素，只看题目本身。\n"
+        "严格只回答一个字：是 或 否。"
+    )
+    # 题型判断是小请求：超时和 max_tokens 都掐小，挂了也不该拖累解答本身
+    CLASSIFY_TIMEOUT = 20
+    CLASSIFY_MAX_TOKENS = 16
 
     def __init__(self, mode: str = "api", api_key: str = "", api_url: str = "",
                  model: str = "", no_thinking: bool = True,
+                 coding_thinking: bool = True,
                  dialect: Any = None, api_extra_body: dict | None = None):
         self.mode = mode
         self.api_key = api_key
@@ -314,11 +380,25 @@ class AnswerProvider:
         # 关掉模型的深度思考（见 _call_api）。留成开关是因为「要不要思考」
         # 本质是取舍：面试场景要首字快，别的用法可能宁可等更好的推理
         self.no_thinking = no_thinking
+        # 编程/算法题自动开深度思考：OCR 模式关键词识别、image 模式先判题型，
+        # 判成编程题就无视 no_thinking，显式请求思考（见 looks_like_coding /
+        # _classify_coding / _thinking_mode）
+        self.coding_thinking = coding_thinking
         # 端点认不认 thinking 字段（探到 400 就本次运行不再发，见 _call_api）
         self._thinking_param = True
         # 重试时的进度回调（App 会接到浮层上）。代理抖一下要等 2s+4s，
         # 这十几秒里不说话，用户只会以为程序死了
         self.status_cb: Callable[[str], None] | None = None
+
+    def _thinking_mode(self, explicit: str | None = None) -> str:
+        """这次请求的思考模式："off" 请求关、"on" 请求开、"default" 不发字段。
+
+        :param explicit: 编程题检测给出的指定（"on"）；None=按 no_thinking 配置。
+        端点不认 thinking 字段（_thinking_param=False）时一律退回 default ——
+        请求关和请求开都发不出去，只能让模型自己决定。
+        """
+        want = explicit or ("off" if self.no_thinking else "default")
+        return want if self._thinking_param else "default"
 
     def _resolve_dialect(self) -> Any:
         """懒解析方言：首次调用时从 url 自动判断，并缓存。"""
@@ -368,13 +448,46 @@ class AnswerProvider:
 
         多张的场景与 answer_from_passes 一样：长题一屏截不完，按追加键
         再截一张，让模型把几张当同一道题合并作答。
+
+        image 模式本地读不到题面，判断不了题型：开启 coding_thinking 时
+        先发一次小请求判题型，判成编程题才让解答请求开深度思考
+        （见 _classify_coding）。判断挂了按非编程题处理，不影响解答。
         """
         valid = [s for s in shots if s is not None]
         if not valid:
             return ""
+        thinking = None
+        if (self.coding_thinking and self.mode == "api"
+                and self.api_key and self.api_url):
+            self._say("判断题型中…（编程/算法题将开启深度思考）")
+            if self._classify_coding(valid):
+                thinking = "on"
+                print("[api] 判定为编程/算法题，本次解答开启深度思考")
         return self._answer_with_retry(
             self.image_content(valid), on_text,
-            recap=f"【已采集 {len(valid)} 张截图，未能送达】")
+            recap=f"【已采集 {len(valid)} 张截图，未能送达】",
+            thinking=thinking)
+
+    def _classify_coding(self, shots: list) -> bool:
+        """截图 → 是不是编程/算法题（image 模式专用，coding_thinking 开着才调）。
+
+        只发一次小请求：max_tokens 掐到 16、超时 20s、不思考、不重试。
+        判断失败一律当「不是编程题」—— 顶多这道题不开思考（回到原来的
+        快而浅），不能让一个辅助步骤把整轮解答变成故障。
+        """
+        content = list(self.image_content(shots)[:-1])   # 去掉解答提示词
+        content.append({"type": "text", "text": self.CLASSIFY_PROMPT})
+        try:
+            text = self._call_api(content, max_tokens=self.CLASSIFY_MAX_TOKENS,
+                                  thinking="off", timeout=self.CLASSIFY_TIMEOUT)
+        except Exception as e:
+            print(f"[api] 题型判断失败（按非编程题处理，不开思考）: {e}")
+            return False
+        out = text.strip()
+        coding = out.startswith("是")
+        print(f"[api] 题型判断：{'编程/算法题' if coding else '非编程题'}"
+              f"（模型答 {out[:8]!r}）")
+        return coding
 
     # -------- OCR 文本模式 --------
     def answer_from_passes(self, passes: list[str],
@@ -384,12 +497,21 @@ class AnswerProvider:
 
         场景：题目很长/分屏展示，第一次只识别到一部分；滚动或翻页后
         再识别一次，把多段拼起来让 AI 合并去重后作答。
+
+        OCR 模式本地就有题面文本：按关键词识别编程/算法题（零开销、
+        不发请求），判成就让解答请求开深度思考。识别只是辅助 —— 漏了
+        也不怕，提示词里的 CODING_RULES 是条件式的，模型自己还会判断。
         """
         valid = [p.strip() for p in passes if p and p.strip()]
         if not valid:
             return ""
+        thinking = None
+        if self.coding_thinking and looks_like_coding("\n".join(valid)):
+            thinking = "on"
+            print("[api] 题面命中编程题特征，本次解答开启深度思考")
         if len(valid) == 1:
-            return self._answer_with_retry(valid[0], on_text)
+            return self._answer_with_retry(
+                valid[0] + "\n\n" + CODING_RULES, on_text, thinking=thinking)
 
         sections = "\n\n".join(
             f"【第 {i} 次识别】\n{p}" for i, p in enumerate(valid, 1)
@@ -399,19 +521,22 @@ class AnswerProvider:
             "多次屏幕 OCR 识别结果：题目较长，分了几次截取，各段之间"
             "可能有内容重叠、顺序交错或个别字识别错误。请先把这几段"
             "合并还原成一道完整的题目（在心中去重对齐，不要输出合并过程），"
-            "然后直接给出简洁准确的答案；如果是代码题请给出完整可运行的代码。\n\n"
+            "然后直接给出简洁准确的答案。\n"
+            + CODING_RULES + "\n\n"
             + sections
         )
-        return self._answer_with_retry(merged, on_text)
+        return self._answer_with_retry(merged, on_text, thinking=thinking)
 
     def _answer_with_retry(self, content: str | list,
                            on_text: Callable[[str], None] | None = None,
-                           recap: str = "") -> str:
+                           recap: str = "",
+                           thinking: str | None = None) -> str:
         """
         :param content: str = OCR 文本模式的题目；list = 图文混合 content blocks
         :param recap: 失败时附在错误信息前的「这次拿到了什么」。文本模式默认
                       把识别到的题目原样带上（不至于白识别一遍）；图片模式
                       没有文本可带，只能说明采了几张
+        :param thinking: "on"=编程题检测要求开思考；None=按 no_thinking 配置
         """
         if isinstance(content, str):
             if not content.strip():
@@ -428,7 +553,8 @@ class AnswerProvider:
         last_err = None
         for attempt in range(3):
             try:
-                return self._call_api(content, on_text=on_text)
+                return self._call_api(content, on_text=on_text,
+                                      thinking=thinking)
             except StreamInterrupted as e:
                 # 已经流出来的半页答案比「从头再来」有用：用户正照着抄，
                 # 把浮层推回开头等于让他白抄一遍。所以不重试，保留 + 标一行
@@ -558,7 +684,9 @@ class AnswerProvider:
     IDLE_TIMEOUT = 180
 
     def _call_api(self, content: str | list, max_tokens: int = 4096,
-                  on_text: Callable[[str], None] | None = None) -> str:
+                  on_text: Callable[[str], None] | None = None,
+                  thinking: str | None = None,
+                  timeout: float | None = None) -> str:
         """流式调用模型 API。
 
         :param content: 完整的 user 消息 —— str（纯文本）或 content blocks 列表
@@ -566,18 +694,27 @@ class AnswerProvider:
         :param on_text: 增量回调，见 collect_sse_answer。None 也照样走流式 ——
                         流式顺手解决了长答案在 60s 处超时那个坑（见
                         IDLE_TIMEOUT），后台整理历史记录同样受益。
+        :param thinking: "on"/"off" 显式指定思考模式（编程题检测 / 题型判断用），
+                        None=按 no_thinking 配置（见 _thinking_mode）。
+        :param timeout: 本次请求的空闲超时秒数，None=IDLE_TIMEOUT（题型判断
+                        这种小请求会传个短值，挂了也别挂满 180s）。
         :return: 完整答案正文
         """
         dialect = self._resolve_dialect()
-        payload = dialect.build_messages(
-            content, self.model, self.no_thinking and self._thinking_param,
-            self.api_extra_body,
-        )
+        mode = self._thinking_mode(thinking)
+        payload = dialect.build_messages(content, self.model, mode,
+                                         self.api_extra_body)
         # 手动注入 max_tokens（收集器可能希望更大）
         payload["max_tokens"] = max_tokens
+        # Anthropic 要求 max_tokens > budget_tokens：开了思考就把总预算抬到
+        # 预算之上（思考 + 完整答案都有地方放）
+        tp = payload.get("thinking")
+        if isinstance(tp, dict) and tp.get("type") == "enabled":
+            payload["max_tokens"] = max(max_tokens,
+                                        tp.get("budget_tokens", 0) + 4096)
 
         try:
-            resp = self._open(payload, dialect)
+            resp = self._open(payload, dialect, timeout=timeout)
         except ApiError as e:
             # 换到不认 thinking 字段的端点时别整个功能挂掉（第三方代理各有各的脾气）：
             # 去掉字段重来一次，并记下本次运行不再发它
@@ -606,15 +743,24 @@ class AnswerProvider:
             resp.close()
 
         if think_chars:
-            # 开关没生效（端点自己加的思考/忽略了字段）。不影响答案，但首字会慢
-            print(f"[api] 本次仍有 {think_chars} 字深度思考（端点未采纳关闭请求）")
+            if mode == "on":
+                # 这是我们主动要的思考（编程题）：不是端点不听话
+                print(f"[api] 深度思考已生效（思考 {think_chars} 字后作答）")
+            else:
+                # 开关没生效（端点自己加的思考/忽略了字段）。不影响答案，但首字会慢
+                print(f"[api] 本次仍有 {think_chars} 字深度思考（端点未采纳关闭请求）")
         if not text.strip():
             # 空响应当失败抛出去，让上层重试；否则浮层会永远停在「AI 作答中…」
             raise RuntimeError("服务端没有返回正文（流里没有 text 增量）")
         return text
 
-    def _open(self, payload: dict, dialect: Any):
-        """发请求，返回**还没读**的响应对象（流式要自己逐行读）。"""
+    def _open(self, payload: dict, dialect: Any,
+              timeout: float | None = None):
+        """发请求，返回**还没读**的响应对象（流式要自己逐行读）。
+
+        :param timeout: 空闲超时秒数，None=IDLE_TIMEOUT（题型判断的小请求
+                        会传短值，判不出来就放弃，别占着解答的时间）
+        """
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -636,7 +782,7 @@ class AnswerProvider:
         req = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST")
         try:
-            return urllib.request.urlopen(req, timeout=self.IDLE_TIMEOUT)
+            return urllib.request.urlopen(req, timeout=timeout or self.IDLE_TIMEOUT)
         except urllib.error.HTTPError as e:
             detail = ""
             try:
@@ -740,6 +886,7 @@ class App:
             api_url=self.cfg.api_url,
             model=self.cfg.api_model,
             no_thinking=self.cfg.api_no_thinking,
+            coding_thinking=self.cfg.api_coding_thinking,
             dialect=resolve_dialect(
                 self.cfg.api_format, self.cfg.api_url, self.cfg.api_extra_body),
             api_extra_body=self.cfg.api_extra_body,
@@ -1559,6 +1706,7 @@ def cmd_refine(args) -> int:
     provider = AnswerProvider(mode="api", api_key=cfg.api_key,
                               api_url=cfg.api_url, model=cfg.api_model,
                               no_thinking=cfg.api_no_thinking,
+                              coding_thinking=False,   # 整理存档不需要思考
                               dialect=resolve_dialect(
                                   cfg.api_format, cfg.api_url,
                                   cfg.api_extra_body),

@@ -61,6 +61,12 @@ class Config:
     # 让模型别做深度思考：答题要的是「马上出字、边看边抄」，思考链再漂亮也
     # 是干等（实测首个正文字 21s → 6s）。False=不干预，模型爱想多久想多久
     api_no_thinking: bool = True
+    # 编程/算法题自动开深度思考：判成编程题的请求忽略 no_thinking，改为显式
+    # 开启思考（Anthropic 格式发 thinking enabled + 预算 8192）。OCR 模式按
+    # 题面关键词识别（零开销）；image 模式本地没有题面，先发一次轻量请求
+    # 判断题型（每题多 1~3 秒）。OpenAI 格式端点的思考开关各家写法不同，
+    # 仍由 extra_body 控制，此项不生效
+    api_coding_thinking: bool = True
 
     # --- 投递（核心：默认浮层） ---
     delivery: DeliveryMode = DeliveryMode.OVERLAY
@@ -344,6 +350,8 @@ def load_config(path: str = "config.yaml") -> Config:
     if isinstance(extra, dict):
         cfg.api_extra_body = extra
     cfg.api_no_thinking = bool(api.get("no_thinking", cfg.api_no_thinking))
+    cfg.api_coding_thinking = bool(api.get("coding_thinking",
+                                           cfg.api_coding_thinking))
     if not cfg.api_key:
         cfg = _load_api_from_keyfile(cfg, path)
 

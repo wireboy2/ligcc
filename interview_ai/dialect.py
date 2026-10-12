@@ -46,9 +46,10 @@ class Dialect:
     headers: dict                    # 除 Authorization 之外要带的固定头
     # 请求体（返回完整 payload dict，上层只管 set 头）
     build_messages: Callable[
-        [Any, str, bool, dict],
+        [Any, str, str, dict],
         dict
-    ]  # content（str|list） → 完整请求体 dict（model/max_tokens/stream/messages/…）
+    ]  # content（str|list）+ thinking（"off"/"on"/"default"）→ 完整请求体 dict
+       #   （model/max_tokens/stream/messages/…）
     # 图片块（仅 anthropic 用；openai 在 build_messages 内就地转换，默认 None）
     pic_block: Callable[[Shot], dict] | None = None
     # 响应流
@@ -62,15 +63,27 @@ class Dialect:
 # ---------------------------------------------------------------------------
 # Anthropic 方言（默认，保持现有行为）
 # ---------------------------------------------------------------------------
+# 深度思考的 token 预算（Anthropic 格式的 thinking.enabled 必带 budget_tokens，
+# 且要求 max_tokens > budget_tokens —— 上层 _call_api 会把 max_tokens 抬上去）。
+# 8k 对一道 OJ 算法题的推演足够，又不至于让简单题白等太久
+THINKING_BUDGET = 8192
+
+
 def _anthropic_pic_block(shot: Shot) -> dict:
     return shot.to_block()
 
 
 def _anthropic_build_messages(
-    content: Any, model: str, thinking_disabled: bool, extra: dict
+    content: Any, model: str, thinking: str, extra: dict
 ) -> dict:
     """Anthropic 的 system prompt 位置独特（顶层），其它都塞 user 消息。
-    返回完整 payload dict。"""
+    返回完整 payload dict。
+
+    thinking 三态：
+      "off"     发 thinking: {"type": "disabled"}（答题要首字快，默认）
+      "on"      发 thinking: {"type": "enabled"} + 预算（编程/算法题）
+      "default" 不发字段，模型/端点自己决定
+    """
     payload = {
         "model": model,
         "max_tokens": 4096,
@@ -78,8 +91,10 @@ def _anthropic_build_messages(
         "messages": [{"role": "user", "content": content}],
     }
     kwargs: dict = {}
-    if thinking_disabled:
+    if thinking == "off":
         kwargs["thinking"] = {"type": "disabled"}
+    elif thinking == "on":
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": THINKING_BUDGET}
     # extra 放在顶层，Anthropic 目前只认 model/max_tokens/stream/thinking
     kwargs.update(extra)
     payload.update(kwargs)
@@ -155,11 +170,12 @@ def _openai_pic_block(shot: Shot) -> dict:
 
 
 def _openai_build_messages(
-    content: Any, model: str, thinking_disabled: bool, extra: dict
+    content: Any, model: str, thinking: str, extra: dict
 ) -> dict:
     """OpenAI 的 messages 就是平铺列表，无 system 顶层字段（除非用 Responses API，
     这里统一按 Chat Completions 处理）。
-    关思考的字段各家不同，不在这里猜测，交给调用方通过 extra_body 传。"""
+    思考开关各家字段不同（GLM thinking:false、Kimi reasoning_effort），不在这里
+    猜测 —— off/on 都不自动加字段，交给调用方通过 extra_body 传。"""
     sys_text = ""
     if isinstance(content, str):
         user_content: Any = content
@@ -316,18 +332,19 @@ if __name__ == "__main__":
              nbytes=100, fingerprint="a", scaled=False)
     print("=== ANTHROPIC ===")
     print(ANTHROPIC.pic_block(s))
-    print(ANTHROPIC.build_messages("题目", "claude-sonnet-4-5", True, {}))
+    print(ANTHROPIC.build_messages("题目", "claude-sonnet-4-5", "off", {}))
+    print(ANTHROPIC.build_messages("题目", "claude-sonnet-4-5", "on", {}))
     print(ANTHROPIC.text_delta({"type": "content_block_delta",
                                 "delta": {"text": "hi"}}))
     print("=== OPENAI ===")
     print(OPENAI.pic_block(s))
-    print(OPENAI.build_messages("题目", "gpt-4o", False, {}))
+    print(OPENAI.build_messages("题目", "gpt-4o", "off", {}))
     print(OPENAI.build_messages(
         [{"type": "text", "text": "【第 1 张截图】"},
          {"type": "image", "source": {"type": "base64",
                                       "media_type": "image/webp",
                                       "data": "dGVzdA=="}}],
-        "glm-4.6v", False, {}))
+        "glm-4.6v", "off", {}))
     print(resolve_dialect("auto", "https://example.com/v1/messages"))
     print(resolve_dialect("auto", "https://api.deepseek.com/v1/chat/completions"))
     print(resolve_dialect("openai", "https://any.url"))

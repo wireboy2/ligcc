@@ -41,6 +41,9 @@
 - **答案边写边看**：模型的输出走 SSE 流式接收，收到一块就刷一次浮层（约 8 fps 节流），
   首字通常 6 秒左右出现，不用等整篇写完；正在翻看的位置不会被增量刷新拽回开头。
   默认还会请求关掉深度思考（`thinking: disabled`），首字实测 21s → 6s。
+  编程/算法题例外：判成编程题就显式开启深度思考（OCR 模式按题面关键词识别；
+  image 模式先发一次小请求判题型），且解法必含 Java 版本、多输入输出强制
+  `java.util.Scanner` 传统 IO（`api.coding_thinking`，默认开）。
 - **共享里隐身**：浮层调用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`，
   腾讯会议 / Zoom / Teams / OBS / 微信共享屏幕都抓不到它（本机肉眼可见）。
 - **不挡操作**：浮层是「点击穿透」窗口，鼠标点击照常落到下层 IDE / 浏览器。
@@ -517,6 +520,7 @@ python overlay.py
 - **流式答案** —— ✅ 已实现（`main.py:collect_sse_answer` / `StreamSink`）：
   `stream: true` 逐块投浮层，并默认发 `thinking: {"type": "disabled"}` 关掉深度思考，
   实测首字 21s → 6s。要看模型的思考过程就把 `api.no_thinking` 设成 `false`。
+  编程/算法题自动开思考也已实现（`main.py:looks_like_coding` / `AnswerProvider._classify_coding`）。
 - **复盘导出增强** —— 按日期/关键词筛选、导出 HTML 或单页；`--export-md`
   目前是全量重写 `复盘记录.md`。（`history.py`、`main.py:cmd_export_md`）
 - **image-only 精简打包** —— 默认模式压根不用 paddle，`build.spec` 排掉它能把 1.1GB
